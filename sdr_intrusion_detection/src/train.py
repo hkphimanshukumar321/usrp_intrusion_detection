@@ -271,7 +271,7 @@ def train_model(
             model.parameters(), lr=cfg['lr'], weight_decay=cfg['weight_decay']
         )
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode='min', factor=0.5, patience=5, min_lr=1e-6, verbose=True
+            optimizer, mode='min', factor=0.5, patience=5, min_lr=1e-6
         )
 
         # Training loop with early stopping
