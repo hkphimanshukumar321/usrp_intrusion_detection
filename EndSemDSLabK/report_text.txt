@@ -1,0 +1,119 @@
+--- PAGE 1 ---
+Real-Time SDR-Based Physical Intrusion Detection
+System Using GNU Radio And USRP B210
+Shubham Gupta [24SP06001]
+Himanshu Kumar [24SP06015]
+24 April 2025
+1. Introduction
+Software Defined Radio (SDR) has transformed the way wireless communication and
+sensing systems are designed and deployed. This report presents the design and imple-
+mentation of a real-time physical intrusion detection system (PIDS) using SDR hardware
+(USRP B210) and GNU Radio. The system functions similarly to a passive radar, relying
+on signal reflections caused by movement or intrusion in a monitored area.
+2. System Overview
+The proposed system operates by transmitting a known waveform using a USRP B210,
+receiving the reflected signal, and analyzing it for anomalies. It functions through the
+following pipeline:
+Figure 1: Overall GNU Radio Flowgraph
+• Continuous waveform generation and QPSK modulation.
+• Transmission using USRP B210.
+• Reception of the reflected signal.
+• Signal processing: AGC, filtering, demodulation, and detection.
+• Motion detection using peak detection and thresholding.
+• Audio alarm triggering.
+1
+
+--- PAGE 2 ---
+3. Transmitter Design
+Figure 2: Transmitting Block
+3.1. Signal Generation
+A cosine wave of 1 kHz is generated with a sample rate of 1.92M. This baseband signal
+serves as the signature waveform.
+3.2. Modulation
+The signal is modulated using QPSK with no differential encoding and a sample-per-
+symbol (sps) value of 10. Excess bandwidth is set at 0.35.
+3.3. Filtering and Transmission
+An interpolating FIR filter upsamples the modulated signal (interpolation factor: 8). The
+output is transmitted using USRP Sink at a center frequency of 2.4 GHz.
+4. Receiver Design
+4.1. Signal Acquisition and Conditioning
+The USRP Source block captures the reflected signal using the same frequency and sample
+rate. AGC ensures stable signal amplitude regardless of movement distance.
+Figure 3: Receiving Block
+2
+
+--- PAGE 3 ---
+4.2. Baseband Conversion and Filtering
+The signal is mixed with a local oscillator (Multiply block), then filtered and downsampled
+using a Decimating FIR Filter (Decimation: 16, Taps: 64).
+4.3. Demodulation
+• Root Raised Cosine Filter: Reduces ISI.
+• Symbol Sync: Recovers symbol timing using Mueller-Muller method.
+• Costas Loop: Locks onto carrier phase.
+• Constellation Decoder: Extracts bitstream.
+4.4. Alarm Logic and Detection
+• Peak Detector: Identifies motion-induced spikes.
+• Threshold Block: Binarizes signal (e.g., TH high: 20, low: -20).
+• Binary Slicer: Converts to binary (0 or 1).
+• Tone Generator and Multiply: Mixes with intrusion signal.
+• Audio Sink: Triggers real-time alarm tone.
+Figure 4: Alarm Block
+5. Why USRP B210?
+• Dual-channel SDR with MIMO capabilities.
+• Operates in wide frequency range: 70 MHz to 6 GHz.
+• Compatible with GNU Radio for prototyping.
+• USB 3.0 support enables real-time data streaming.
+3
+
+--- PAGE 4 ---
+6. Results
+The system successfully identifies motion within the detection region. The reflected signal
+perturbation causes the peak detector to activate, which in turn crosses the set threshold,
+resulting in an audible alarm. Debugging via QT GUI Time Sink validates signal flow
+and detection logic.
+Figure 5: Without Interference
+Figure 6: With Interference
+7. Future Scope
+7.1. Machine Learning Integration for Intelligent Intrusion Clas-
+sification
+• Apply supervised learning techniques (SVM, Random Forest, CNN) on the captured
+signal data to:
+– Differentiate between types of movements (human, animal, wind disturbances).
+– Reduce false alarms through smarter pattern recognition.
+– Build a predictive security system that adapts over time.
+4
+
+--- PAGE 5 ---
+Smart Alert Systems
+• Integrate with APIs or IoT modules to:
+– Send SMS/Email/Notifications to authorized users.
+– Trigger external devices such as lights, cameras, or smart locks.
+– Connect with home automation systems (like Alexa, Google Home).
+Directional Antenna Deployment
+• Employ beamforming or use directional antennas to:
+– Focus the detection area (specific hallway or entrance).
+– Reduce environmental noise and increase detection accuracy.
+– Enable spatial tracking or intrusion location estimation.
+Multi-Node Intrusion Detection Network
+• Expand the system into a multi-receiver or multi-transmitter setup:
+– Cover large areas such as industrial zones or borders.
+– Perform triangulation to locate the intruder precisely.
+– Improve redundancy and fault tolerance.
+Remote Monitoring and Cloud Logging
+• Enable remote access and data
+8. Conclusion
+The developed SDR-based intrusion detection system offers a flexible and scalable
+approach to motion detection in secured environments. Utilizing USRP hardware
+with GNU Radio allows rapid prototyping and real-time performance, making this
+approach viable for home, office, and industrial security applications.
+References
+[1] GNU Radio, An Open-Source Toolkit for Software Radio.
+[2] Ettus Research, USRP B210 Product Datasheet, USRP Hardware Driver and
+USRP Manual. National Instruments.
+[3] M. Skolnik, Introduction to Radar Systems, 3rd ed., McGraw-Hill, 2001. (For
+Doppler effect and signal reflections)
+[4] A. G. Zaji, M. Bahadori, “A Simple and Efficient Peak Detection Algorithm for
+Real-Time Applications,” Journal of Signal and Information Processing, Vol. 5
+No. 2, 2014, pp. 111-117.
+5
+

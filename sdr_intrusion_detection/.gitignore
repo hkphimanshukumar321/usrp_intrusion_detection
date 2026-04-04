@@ -1,0 +1,68 @@
+# ============================================================
+# SDR Intrusion Detection Project - .gitignore
+# ============================================================
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# --- Virtual Environment ---
+venv/
+env/
+.venv/
+.env/
+
+# --- Dataset files (large binary) ---
+dataset/simulated/*.dat
+dataset/bloodhound/
+*.dat
+!sdr_flowgraphs/*.grc
+
+# --- Model checkpoints ---
+results/models/*.pt
+results/models/*.pth
+results/models/*.onnx
+*.ckpt
+
+# --- Results (regeneratable) ---
+results/figures/*.png
+results/figures/*.pdf
+results/figures/*.svg
+
+# --- Jupyter ---
+.ipynb_checkpoints/
+notebooks/.ipynb_checkpoints/
+
+# --- IDE ---
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# --- OS ---
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- GNU Radio ---
+*.pyc
+*.pyo
+*~
+*.log
+
+# --- Misc ---
+*.bak
+*.tmp
+report_text.txt
+
+dataset/*
+!dataset/.gitkeep
+results/*
+!results/.gitkeep
