@@ -171,7 +171,7 @@ blocks:
     maxoutbuf: '0'
     min: '0'
     minoutbuf: '0'
-    num_samps: '0'
+    num_samps: '1000'
     repeat: 'True'
     type: byte
   states:
@@ -284,8 +284,8 @@ blocks:
     look_ahead: '10'
     maxoutbuf: '0'
     minoutbuf: '0'
-    threshold_factor_fall: '20'
-    threshold_factor_rise: '10'
+    threshold_factor_fall: '1.2'
+    threshold_factor_rise: '1.5'
     type: float
   states:
     bus_sink: false
@@ -857,6 +857,46 @@ blocks:
     coordinate: [544, 808]
     rotation: 0
     state: enabled
+- name: blocks_null_sink_0
+  id: blocks_null_sink
+  parameters:
+    affinity: ''
+    alias: ''
+    bus_structure_sink: '[[0,],]'
+    comment: ''
+    num_inputs: '1'
+    type: complex
+    vlen: '1'
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [1480, 608]
+    rotation: 0
+    state: enabled
+
+    state: enabled
+- name: blocks_throttle2_0
+  id: blocks_throttle2
+  parameters:
+    affinity: ''
+    alias: ''
+    comment: 'Limit CPU usage in simulation'
+    ignoretag: 'True'
+    limit: auto
+    maximum: '0.1'
+    maxoutbuf: '0'
+    minoutbuf: '0'
+    samples_per_second: samp_rate
+    type: complex
+    vlen: '1'
+  states:
+    bus_sink: false
+    bus_source: false
+    bus_structure: null
+    coordinate: [544, 212]
+    rotation: 0
+    state: enabled
 
 connections:
 - [analog_agc_xx_0, '0', blocks_complex_to_mag_0, '0']
@@ -870,10 +910,12 @@ connections:
 - [blocks_complex_to_mag_0, '0', blocks_peak_detector_xb_0, '0']
 - [blocks_multiply_const_jam, '0', blocks_add_xx_0, '1']
 - [blocks_peak_detector_xb_0, '0', blocks_uchar_to_float_0, '0']
+- [blocks_throttle2_0, '0', channels_channel_model_0, '0']
 - [blocks_uchar_to_float_0, '0', qtgui_time_sink_spikes, '0']
 - [channels_channel_model_0, '0', blocks_add_xx_0, '0']
-- [digital_constellation_modulator_0, '0', channels_channel_model_0, '0']
+- [digital_constellation_modulator_0, '0', blocks_throttle2_0, '0']
 - [digital_constellation_modulator_0, '0', qtgui_time_sink_tx, '0']
+- [digital_costas_loop_cc_0, '0', blocks_null_sink_0, '0']
 - [digital_symbol_sync_xx_0, '0', digital_costas_loop_cc_0, '0']
 - [root_raised_cosine_filter_0, '0', digital_symbol_sync_xx_0, '0']
 
