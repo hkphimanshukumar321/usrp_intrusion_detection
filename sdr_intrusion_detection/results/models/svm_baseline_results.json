@@ -1,0 +1,14 @@
+{
+  "model_name": "svm_baseline",
+  "num_params": "N/A (non-parametric)",
+  "mean_accuracy": 0.5417500000000001,
+  "std_accuracy": 0.007535333436550789,
+  "fold_accuracies": [
+    0.533125,
+    0.5325,
+    0.544375,
+    0.55,
+    0.54875
+  ],
+  "feature_dim": 20
+}
