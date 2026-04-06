@@ -2,6 +2,17 @@
 
 > **"From Spikes to CNNs: Dual-Representation Deep Learning for Biological and Drone Intrusion Classification via RF Micro-Doppler Scattering"**
 
+## 📺 Working Demo
+
+<div align="center">
+  <a href="https://youtu.be/37KKIDViSdk?si=8DaRWh_QFtZXthVp">
+    <img src="https://img.youtube.com/vi/37KKIDViSdk/maxresdefault.jpg" alt="SDR Intrusion Detection Demo" style="width:100%; max-width:600px; border-radius: 10px; box-shadow: 0 4px 8px rgba(0,0,0,0.2);">
+  </a>
+  <p><i>Click the thumbnail above to watch the system classify intrusions in real-time.</i></p>
+</div>
+
+---
+
 ## Overview
 This project constitutes a complete end-to-end framework for a **Device-Free Physical Intrusion Detector** (A Burglar Alarm using RF). By utilizing Software Defined Radios (SDR), the system propagates a continuous RF wave. When humans, animals, or drones cross the invisible Line-of-Sight (LoS) path, their physical forms scatter the transmission.
 

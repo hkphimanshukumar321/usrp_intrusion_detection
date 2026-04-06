@@ -18,7 +18,7 @@ def test_pipeline_smoke(tmp_path):
             data_dir=str(data_dir),
             results_dir=str(results_dir),
             figures_dir=str(figures_dir),
-            duration=0.5, # even smaller for test speed
+            duration=0.1, # extremely small for test speed
             snr_db=20.0,
             epochs=1,
             batch_size=32,
