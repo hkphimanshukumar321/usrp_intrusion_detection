@@ -6,7 +6,7 @@ Before diving into the figures, it's important to define the baseline models we 
 
 ### Spike Detect (Traditional Baseline)
 **What it is:** This is the non-Machine Learning traditional baseline. It is a direct port of the GNU Radio Flowgraph block (`gr::blocks::peak_detector_fb`). 
-**How it works:** It processes the raw IQ signal, calculates its magnitude, and maintains a running average. When a signal peak exceeds a certain threshold (accounting for `alpha` running average, rise/fall times, and hysteresis), it triggers a "1" (a spike). The algorithm then calculates the "Spike Density" over a full window and uses nearest-neighbor statistical thresholds boundaries to guess the classification (Clear, Human, Animal, Drone).
+**How it works:** It processes the raw IQ signal, calculates its magnitude, and maintains a running average. When a signal peak exceeds a eresis), it triggers a "1" (a spike). The algorithm thecertain threshold (accounting for `alpha` running average, rise/fall times, and hystn calculates the "Spike Density" over a full window and uses nearest-neighbor statistical thresholds boundaries to guess the classification (Clear, Human, Animal, Drone).
 **Why use it:** This operates as the absolute baseline. If Deep Learning models cannot beat this, then applying neural networks to the SDR is computationally wasteful. (Spoiler: the DL models completely outperform it).
 
 ### MLP Baseline (Simplest Deep Learning Baseline)

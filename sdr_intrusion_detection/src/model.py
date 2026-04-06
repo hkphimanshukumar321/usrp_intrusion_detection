@@ -101,6 +101,122 @@ class SEBlock2D(nn.Module):
 
 
 # ============================================================
+# Advanced Utility Layers for SOTA
+# ============================================================
+class ChannelAttention(nn.Module):
+    def __init__(self, in_planes, ratio=16):
+        super().__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        
+        self.fc1 = nn.Conv2d(in_planes, in_planes // ratio, 1, bias=False)
+        self.relu1 = nn.ReLU()
+        self.fc2 = nn.Conv2d(in_planes // ratio, in_planes, 1, bias=False)
+
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avg_out = self.fc2(self.relu1(self.fc1(self.avg_pool(x))))
+        max_out = self.fc2(self.relu1(self.fc1(self.max_pool(x))))
+        return self.sigmoid(avg_out + max_out)
+
+class SpatialAttention(nn.Module):
+    def __init__(self, kernel_size=7):
+        super().__init__()
+        assert kernel_size in (3, 7), 'kernel size must be 3 or 7'
+        padding = 3 if kernel_size == 7 else 1
+        self.conv1 = nn.Conv2d(2, 1, kernel_size, padding=padding, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        x_cat = torch.cat([avg_out, max_out], dim=1)
+        return self.sigmoid(self.conv1(x_cat))
+
+class CBAM(nn.Module):
+    """Convolutional Block Attention Module"""
+    def __init__(self, in_planes, ratio=16, kernel_size=7):
+        super().__init__()
+        self.ca = ChannelAttention(in_planes, ratio)
+        self.sa = SpatialAttention(kernel_size)
+
+    def forward(self, x):
+        x = x * self.ca(x)
+        x = x * self.sa(x)
+        return x
+
+class ResidualBlock1D(nn.Module):
+    def __init__(self, in_ch, out_ch, kernel_size=3, stride=1, padding=1):
+        super().__init__()
+        self.conv1 = nn.Conv1d(in_ch, out_ch, kernel_size, stride=stride, padding=padding, bias=False)
+        self.bn1 = nn.BatchNorm1d(out_ch)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv1d(out_ch, out_ch, kernel_size, stride=1, padding=padding, bias=False)
+        self.bn2 = nn.BatchNorm1d(out_ch)
+        
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_ch != out_ch:
+            self.shortcut = nn.Sequential(
+                nn.Conv1d(in_ch, out_ch, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm1d(out_ch)
+            )
+
+    def forward(self, x):
+        out = self.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out += self.shortcut(x)
+        out = self.relu(out)
+        return out
+
+class ResidualBlock2D(nn.Module):
+    def __init__(self, in_ch, out_ch, kernel_size=3, stride=1, padding=1):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_ch, out_ch, kernel_size, stride=stride, padding=padding, bias=False)
+        self.bn1 = nn.BatchNorm2d(out_ch)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(out_ch, out_ch, kernel_size, stride=1, padding=padding, bias=False)
+        self.bn2 = nn.BatchNorm2d(out_ch)
+        
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_ch != out_ch:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_ch, out_ch, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(out_ch)
+            )
+
+    def forward(self, x):
+        out = self.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out += self.shortcut(x)
+        out = self.relu(out)
+        return out
+
+class GatedFusion(nn.Module):
+    """Gated Attention fusion of time (1D) and frequency (2D) features"""
+    def __init__(self, dim):
+        super().__init__()
+        self.attention = nn.Sequential(
+            nn.Linear(dim * 2, dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(dim, 2)  # 2 scores: one for Branch 1, one for Branch 2
+        )
+        
+    def forward(self, f1, f2):
+        # f1, f2 shape: [B, dim]
+        concat_f = torch.cat([f1, f2], dim=-1) # [B, 2*dim]
+        # Softmax over the 2 branches to create a strict gating (confidence) mechanism
+        scores = F.softmax(self.attention(concat_f), dim=-1) # [B, 2]
+        
+        score1 = scores[:, 0].unsqueeze(1) # [B, 1]
+        score2 = scores[:, 1].unsqueeze(1) # [B, 1]
+        
+        # Combine the two domains according to their predicted confidence
+        fused = f1 * score1 + f2 * score2
+        return fused
+
+
+# ============================================================
 # Model 1: MLP Baseline
 # ============================================================
 class MLPBaseline(nn.Module):
@@ -236,15 +352,11 @@ class CNN2D_Spec(nn.Module):
 # ============================================================
 class DualBranchFusionCNN(nn.Module):
     """
-    Dual-branch CNN with feature fusion for RF intrusion detection.
-
-    Branch 1: 1D-CNN on raw IQ [B, W, 2]
-    Branch 2: 2D-CNN on STFT spectrogram [B, 1, F, T]
-    Fusion:   Concatenate branch outputs → MLP → 4-class softmax
-
-    This is our main contribution model: it combines time-domain (IQ)
-    and frequency-domain (spectrogram) representations through late fusion,
-    informed by the spike detection concept from the original GRC flowgraph.
+    SOTA Dual-branch CNN with Gated Feature Fusion for RF intrusion detection.
+    
+    Branch 1: 1D ResNet on raw IQ [B, W, 2]
+    Branch 2: 2D ResNet + CBAM Attention on STFT spectrogram [B, 1, F, T]
+    Fusion:   Gated Attention Fusion -> MLP -> 4-class softmax
     """
 
     def __init__(
@@ -258,38 +370,48 @@ class DualBranchFusionCNN(nn.Module):
     ):
         super().__init__()
 
-        # --- Branch 1: 1D-CNN on raw IQ ---
+        # For gated attention to work symmetrically, branches must output same dimension size
+        if branch1_dim != branch2_dim:
+            branch1_dim = max(branch1_dim, branch2_dim)
+            branch2_dim = max(branch1_dim, branch2_dim)
+            
+        dim = branch1_dim
+
+        # --- Branch 1: 1D ResNet on raw IQ (time-domain) ---
         self.iq_branch = nn.Sequential(
-            ConvBNReLU1D(2, 32, kernel_size=7, stride=1, padding=3),
-            nn.MaxPool1d(2),
-            ConvBNReLU1D(32, 64, kernel_size=5, stride=1, padding=2),
-            nn.MaxPool1d(2),
-            ConvBNReLU1D(64, 128, kernel_size=3, stride=1, padding=1),
-            SEBlock1D(128),
-            nn.MaxPool1d(2),
-            ConvBNReLU1D(128, branch1_dim, kernel_size=3, stride=1, padding=1),
+            # Initial downsampling
+            ConvBNReLU1D(2, 32, kernel_size=7, stride=2, padding=3),
+            
+            # Residual Blocks with strided convolutions (Learnable downsampling instead of MaxPool)
+            ResidualBlock1D(32, 64, kernel_size=5, stride=2, padding=2),
+            ResidualBlock1D(64, dim, kernel_size=3, stride=2, padding=1),
+            
+            SEBlock1D(dim), # Keep 1D attention for channel weighting
             nn.AdaptiveAvgPool1d(1),
             nn.Flatten(),
         )
 
-        # --- Branch 2: 2D-CNN on Spectrogram ---
+        # --- Branch 2: 2D ResNet on Spectrogram (frequency-domain) ---
         self.spec_branch = nn.Sequential(
-            ConvBNReLU2D(1, 32, kernel_size=3, padding=1),
-            nn.MaxPool2d(2),
-            ConvBNReLU2D(32, 64, kernel_size=3, padding=1),
-            nn.MaxPool2d(2),
-            ConvBNReLU2D(64, 128, kernel_size=3, padding=1),
-            SEBlock2D(128),
-            nn.MaxPool2d(2),
-            ConvBNReLU2D(128, branch2_dim, kernel_size=3, padding=1),
+            # Initial downsampling
+            ConvBNReLU2D(1, 32, kernel_size=3, stride=2, padding=1),
+            
+            # Residual Blocks 
+            ResidualBlock2D(32, 64, kernel_size=3, stride=2, padding=1),
+            ResidualBlock2D(64, dim, kernel_size=3, stride=2, padding=1),
+            
+            # SOTA Attention for 2D (Spatial & Channel)
+            CBAM(dim),
+            
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
         )
 
-        # --- Fusion Head ---
-        fused_dim = branch1_dim + branch2_dim
+        # --- Advanced Fusion Module ---
+        self.gated_fusion = GatedFusion(dim)
+        
         self.fusion_head = nn.Sequential(
-            nn.Linear(fused_dim, fusion_dim),
+            nn.Linear(dim, fusion_dim),
             nn.ReLU(inplace=True),
             nn.Dropout(dropout),
             nn.Linear(fusion_dim, 64),
@@ -309,13 +431,15 @@ class DualBranchFusionCNN(nn.Module):
         """
         # Branch 1: IQ
         iq_in = iq.permute(0, 2, 1)  # [B, 2, W]
-        iq_feat = self.iq_branch(iq_in)  # [B, branch1_dim]
+        iq_feat = self.iq_branch(iq_in)  # [B, dim]
 
         # Branch 2: Spectrogram
-        spec_feat = self.spec_branch(spec)  # [B, branch2_dim]
+        spec_feat = self.spec_branch(spec)  # [B, dim]
 
-        # Late fusion
-        fused = torch.cat([iq_feat, spec_feat], dim=1)  # [B, branch1+branch2]
+        # Gated Cross-Attention Fusion
+        fused = self.gated_fusion(iq_feat, spec_feat)  # [B, dim]
+        
+        # Classification MLP
         features = self.fusion_head(fused)  # [B, 64]
         logits = self.output(features)  # [B, num_classes]
 
@@ -326,7 +450,7 @@ class DualBranchFusionCNN(nn.Module):
         iq_in = iq.permute(0, 2, 1)
         iq_feat = self.iq_branch(iq_in)
         spec_feat = self.spec_branch(spec)
-        fused = torch.cat([iq_feat, spec_feat], dim=1)
+        fused = self.gated_fusion(iq_feat, spec_feat)
         features = self.fusion_head(fused)
         return features
 
@@ -403,93 +527,178 @@ class DualBranchLite(nn.Module):
 # ============================================================
 # Model 6: Custom DenseNet (User Contribution)
 # ============================================================
-class DenseBlock(nn.Module):
-    def __init__(self, in_channels, num_layers, growth_rate):
-        super().__init__()
-        self.layers = nn.ModuleList()
-        current_channels = in_channels
-        for _ in range(num_layers):
-            layer = nn.Sequential(
-                nn.BatchNorm2d(current_channels),
-                nn.Conv2d(current_channels, growth_rate, kernel_size=3, padding=1, bias=False),
-                nn.ReLU(inplace=True)
-            )
-            self.layers.append(layer)
-            current_channels += growth_rate
+class ComplexEncoder(nn.Module):
+    """
+    Encodes raw IQ [B, W, 2] -> [B, 4, W]: (I, Q, amplitude, phase).
+    Preserves the complex-valued phase relationship lost by naive channel stacking.
+    """
+    def forward(self, iq: torch.Tensor) -> torch.Tensor:
+        iq = iq.permute(0, 2, 1)                        # [B, 2, W]
+        I, Q = iq[:, 0:1], iq[:, 1:2]
+        amp   = torch.sqrt(I ** 2 + Q ** 2)
+        phase = torch.atan2(Q, I)
+        return torch.cat([I, Q, amp, phase], dim=1)     # [B, 4, W]
 
-    def forward(self, x):
-        features = [x]
-        for layer in self.layers:
-            # Concatenate all previous features
-            concat_features = torch.cat(features, dim=1)
-            new_feature = layer(concat_features)
-            features.append(new_feature)
-        return torch.cat(features, dim=1)
 
-class TransitionBlock(nn.Module):
-    def __init__(self, in_channels, compression):
+class CBAM1D(nn.Module):
+    """
+    1D CBAM: Channel Attention + Spatial Attention.
+    Symmetric counterpart to 2D CBAM used in the spectrogram branch.
+    """
+    def __init__(self, channels: int, reduction: int = 16, kernel_size: int = 7):
         super().__init__()
-        reduced_filters = max(1, int(in_channels * compression))
-        self.block = nn.Sequential(
-            nn.BatchNorm2d(in_channels),
-            nn.Conv2d(in_channels, reduced_filters, kernel_size=1, bias=False),
+        self.avg_pool = nn.AdaptiveAvgPool1d(1)
+        self.max_pool = nn.AdaptiveMaxPool1d(1)
+        self.channel_fc = nn.Sequential(
+            nn.Linear(channels, channels // reduction, bias=False),
             nn.ReLU(inplace=True),
-            nn.AvgPool2d(kernel_size=2, stride=2)
+            nn.Linear(channels // reduction, channels, bias=False),
         )
+        self.spatial_conv = nn.Conv1d(
+            2, 1, kernel_size=kernel_size,
+            padding=kernel_size // 2, bias=False
+        )
+        self.sigmoid = nn.Sigmoid()
 
-    def forward(self, x):
-        return self.block(x)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Channel attention
+        avg = self.channel_fc(self.avg_pool(x).squeeze(-1))
+        mx  = self.channel_fc(self.max_pool(x).squeeze(-1))
+        ca  = self.sigmoid(avg + mx).unsqueeze(-1)
+        x   = x * ca
+        # Spatial attention
+        avg_s = x.mean(dim=1, keepdim=True)
+        max_s = x.max(dim=1, keepdim=True).values
+        sa    = self.sigmoid(self.spatial_conv(torch.cat([avg_s, max_s], dim=1)))
+        return x * sa
 
-class CustomDenseNet(nn.Module):
+
+class CrossModalAttention(nn.Module):
     """
-    Lightweight DenseNet architecture ported from TensorFlow configuration.
-    Inputs: 2D Spectrograms [B, 1, F, T]
+    Lightweight bidirectional cross-attention between IQ and spectrogram feature maps,
+    applied BEFORE global pooling to preserve spatial structure during fusion.
+    
+    IQ   [B, C, L]    attends to Spectrogram [B, C, F*T]
+    Spec [B, C, F*T]  attends to IQ          [B, C, L]
     """
-    def __init__(self, in_channels=1, num_classes=NUM_CLASSES, growth_rate=8, compression=0.5):
+    def __init__(self, dim: int, num_heads: int = 4):
         super().__init__()
-        num_dense_layers = [3, 3, 3]
-        
-        self.init_conv = nn.Sequential(
-            nn.BatchNorm2d(in_channels),
-            nn.Conv2d(in_channels, growth_rate * 2, kernel_size=3, padding=1, bias=False),
-            nn.ReLU(inplace=True)
+        self.iq_to_spec  = nn.MultiheadAttention(dim, num_heads, batch_first=True)
+        self.spec_to_iq  = nn.MultiheadAttention(dim, num_heads, batch_first=True)
+        self.iq_norm     = nn.LayerNorm(dim)
+        self.spec_norm   = nn.LayerNorm(dim)
+
+    def forward(
+        self,
+        iq_maps: torch.Tensor,      # [B, C, L]
+        spec_maps: torch.Tensor,    # [B, C, F, T]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        B, C, L       = iq_maps.shape
+        _, _, F, T    = spec_maps.shape
+
+        iq_seq   = iq_maps.permute(0, 2, 1)                        # [B, L,   C]
+        spec_seq = spec_maps.flatten(2).permute(0, 2, 1)           # [B, F*T, C]
+
+        # IQ attends to spectrogram (residual)
+        iq_ctx,   _ = self.iq_to_spec(iq_seq,   spec_seq, spec_seq)
+        iq_seq      = self.iq_norm(iq_seq + iq_ctx)
+
+        # Spectrogram attends to IQ (residual)
+        spec_ctx, _ = self.spec_to_iq(spec_seq, iq_seq,   iq_seq)
+        spec_seq    = self.spec_norm(spec_seq + spec_ctx)
+
+        iq_out   = iq_seq.permute(0, 2, 1)                         # [B, C, L]
+        spec_out = spec_seq.permute(0, 2, 1).reshape(B, C, F, T)   # [B, C, F, T]
+        return iq_out, spec_out
+
+
+class DualBranchFusionCNN(nn.Module):
+    """
+    Dual-branch CNN with Gated Feature Fusion for RF intrusion detection.
+    
+    Branch 1: 1D ResNet on complex-encoded IQ [B, W, 2] + CBAM1D
+    Branch 2: 2D ResNet + CBAM on STFT spectrogram [B, 1, F, T]
+    Cross-Modal: Bidirectional cross-attention on intermediate feature maps (pre-pool)
+    Fusion:   Gated Attention Fusion -> MLP -> num_classes softmax
+    """
+
+    def __init__(
+        self,
+        window_size: int = WINDOW_SIZE,
+        num_classes: int = NUM_CLASSES,
+        branch_dim: int = 128,          # Single dim arg — both branches must match for GatedFusion
+        fusion_dim: int = 128,
+        dropout: float = 0.3,
+    ):
+        super().__init__()
+
+        assert branch_dim > 0, "branch_dim must be a positive integer"
+        dim = branch_dim
+
+        # --- Branch 1: 1D ResNet on complex-encoded IQ ---
+        self.iq_encoder = ComplexEncoder()          # [B, W, 2] -> [B, 4, W]
+        self.iq_branch  = nn.Sequential(
+            ConvBNReLU1D(4, 32, kernel_size=7, stride=2, padding=3),
+            ResidualBlock1D(32, 64,  kernel_size=5, stride=2, padding=2),
+            ResidualBlock1D(64, dim, kernel_size=3, stride=2, padding=1),
         )
-        
-        current_channels = growth_rate * 2
-        self.blocks = nn.ModuleList()
-        
-        # Dense + Transition Blocks
-        for num_layers in num_dense_layers:
-            db = DenseBlock(current_channels, num_layers, growth_rate)
-            self.blocks.append(db)
-            current_channels += num_layers * growth_rate
-            
-            tb = TransitionBlock(current_channels, compression)
-            self.blocks.append(tb)
-            current_channels = max(1, int(current_channels * compression))
-            
-        self.classifier = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Flatten(),
-            nn.Linear(current_channels, num_classes)
+        self.iq_attn = CBAM1D(dim)                  # Symmetric attention (matches Branch 2)
+
+        # --- Branch 2: 2D ResNet on Spectrogram ---
+        self.spec_branch = nn.Sequential(
+            ConvBNReLU2D(1, 32, kernel_size=3, stride=2, padding=1),
+            ResidualBlock2D(32, 64,  kernel_size=3, stride=2, padding=1),
+            ResidualBlock2D(64, dim, kernel_size=3, stride=2, padding=1),
         )
-        
-    def forward(self, x):
-        """x: [B, 1, F, T] Spectrogram"""
-        x = self.init_conv(x)
-        features = x
-        for block in self.blocks:
-            features = block(features)
-        return self.classifier(features)
-        
-    def get_features(self, x):
-        x = self.init_conv(x)
-        features = x
-        for block in self.blocks:
-            features = block(features)
-        features = F.adaptive_avg_pool2d(features, 1)
-        return features.flatten(1)
-        
+        self.spec_attn = CBAM(dim)                  # Spatial + Channel
+
+        # --- Cross-Modal Attention (before pooling, preserves spatial structure) ---
+        self.cross_attn = CrossModalAttention(dim)
+
+        # --- Pooling ---
+        self.iq_pool   = nn.Sequential(nn.AdaptiveAvgPool1d(1), nn.Flatten())
+        self.spec_pool = nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Flatten())
+
+        # --- Fusion & Classification Head ---
+        self.gated_fusion = GatedFusion(dim)
+        self.fusion_head  = nn.Sequential(
+            nn.Linear(dim, fusion_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(fusion_dim, 64),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+        )
+        self.output = nn.Linear(64, num_classes)
+
+    def _extract_features(self, iq: torch.Tensor, spec: torch.Tensor) -> torch.Tensor:
+        # Branch 1
+        iq_maps  = self.iq_attn(self.iq_branch(self.iq_encoder(iq)))    # [B, dim, L]
+
+        # Branch 2
+        spec_maps = self.spec_attn(self.spec_branch(spec))               # [B, dim, F', T']
+
+        # Cross-modal attention on feature maps (before global pooling)
+        iq_maps, spec_maps = self.cross_attn(iq_maps, spec_maps)
+
+        # Pool -> fuse
+        fused = self.gated_fusion(self.iq_pool(iq_maps), self.spec_pool(spec_maps))
+        return self.fusion_head(fused)                                    # [B, 64]
+
+    def forward(self, iq: torch.Tensor, spec: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            iq:   Raw IQ tensor       [B, W, 2]
+            spec: Spectrogram tensor  [B, 1, F, T]
+        Returns:
+            Logits [B, num_classes]
+        """
+        return self.output(self._extract_features(iq, spec))
+
+    def get_features(self, iq: torch.Tensor, spec: torch.Tensor) -> torch.Tensor:
+        """Extract 64-dim fused embedding (for t-SNE / probing)."""
+        return self._extract_features(iq, spec)
+
     def count_params(self):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
@@ -500,7 +709,6 @@ MODEL_REGISTRY = {
     "mlp_baseline": MLPBaseline,
     "cnn1d_iq": CNN1D_IQ,
     "cnn2d_spec": CNN2D_Spec,
-    "custom_densenet": CustomDenseNet,
     "dual_branch_fusion": DualBranchFusionCNN,
     "dual_branch_lite": DualBranchLite,
 }
@@ -536,7 +744,7 @@ def print_model_summary():
         model = cls()
         n_params = model.count_params()
         input_type = "IQ + Spec" if name in DUAL_INPUT_MODELS else "IQ only"
-        if name in ["cnn2d_spec", "custom_densenet"]:
+        if name in ["cnn2d_spec"]:
             input_type = "Spec only"
         print(f"  {name:<25} {n_params:>12,} {input_type:>20}")
 
@@ -562,7 +770,7 @@ if __name__ == "__main__":
             if name in DUAL_INPUT_MODELS:
                 logits = model(iq, spec)
                 features = model.get_features(iq, spec)
-            elif name in ["cnn2d_spec", "custom_densenet"]:
+            elif name in ["cnn2d_spec"]:
                 logits = model(spec)
                 features = model.get_features(spec)
             else:

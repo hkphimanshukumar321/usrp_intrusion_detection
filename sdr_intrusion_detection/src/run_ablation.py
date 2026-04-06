@@ -16,10 +16,70 @@ import os
 import time
 from datetime import timedelta
 
+try:
+    import optuna
+except ImportError:
+    optuna = None
+
 from src.sim_system import generate_dataset
-from src.train import train_all_models
+from src.train import train_all_models, train_model
 from src.benchmark_edge import benchmark_all_models
 from src.evaluate import generate_all_figures
+
+
+def run_hyperparameter_tuning(
+    data_dir: str,
+    results_dir: str,
+    n_trials: int = 20,
+    epochs: int = 15,
+) -> dict:
+    """Run Optuna study on the target SOTA model."""
+    if optuna is None:
+        print("\n  ❌ Optuna is not installed! Run: pip install optuna")
+        print("  ⏩ Falling back to default hyperparameters.\n")
+        return {}
+
+    print(f"\n{'='*60}")
+    print(f"  PHASE 1.5: Hyperparameter Tuning (Optuna)")
+    print(f"  Model: dual_branch_fusion | Trials: {n_trials} | Base Epochs: {epochs}")
+    print(f"{'='*60}")
+
+    def objective(trial):
+        # Define search space
+        lr = trial.suggest_float('lr', 1e-5, 1e-2, log=True)
+        weight_decay = trial.suggest_float('weight_decay', 1e-6, 1e-2, log=True)
+        batch_size = trial.suggest_categorical('batch_size', [64, 128, 256])
+        label_smoothing = trial.suggest_float('label_smoothing', 0.0, 0.2)
+        
+        cfg = {
+            'epochs': epochs,
+            'batch_size': batch_size,
+            'lr': lr,
+            'weight_decay': weight_decay,
+            'label_smoothing': label_smoothing,
+            'patience': max(3, epochs // 3),
+            'n_folds': 2,  # Quick 2-fold for speed
+            # Use minimal logging
+        }
+        
+        res = train_model(
+            model_name="dual_branch_fusion", 
+            data_dir=data_dir, 
+            output_dir=os.path.join(results_dir, "optuna_temp"),
+            config=cfg
+        )
+        return res.get('best_accuracy', 0.0)
+
+    optuna.logging.set_verbosity(optuna.logging.INFO)
+    study = optuna.create_study(direction='maximize', study_name="RF_CNN_Tuning")
+    study.optimize(objective, n_trials=n_trials)
+    
+    print(f"\n  🎯 BEST HIGHEST ACCURACY: {study.best_value:.4f}")
+    print("  🏆 WINNING PARAMS:")
+    for key, value in study.best_params.items():
+        print(f"    {key}: {value}")
+        
+    return study.best_params
 
 
 def run_full_pipeline(
@@ -34,9 +94,12 @@ def run_full_pipeline(
     skip_train: bool = False,
     skip_benchmark: bool = False,
     quick: bool = False,
+    tune: bool = False,
+    n_trials: int = 20,
+    n_folds: int = 5,
 ):
     """
-    Run the complete pipeline: generate → train → benchmark → evaluate.
+    Run the complete pipeline: generate → tune → train → benchmark → evaluate.
     """
     start_time = time.time()
 
@@ -62,6 +125,21 @@ def run_full_pipeline(
         print("\n  ⏩ Skipping data generation (--skip_data)")
 
     # =========================================
+    # Phase 1.5: Hyperparameter Tuning
+    # =========================================
+    tuned_params = {}
+    if tune:
+        tuned_params = run_hyperparameter_tuning(
+            data_dir=data_dir, 
+            results_dir=results_dir, 
+            n_trials=n_trials if not quick else 2,
+            epochs=min(epochs, 15)  # Cap epochs for tuning iteration speed
+        )
+    else:
+        # User didn't request tuning, proceed normally
+        pass
+
+    # =========================================
     # Phase 2: Train All Models
     # =========================================
     if not skip_train:
@@ -73,7 +151,17 @@ def run_full_pipeline(
             'epochs': epochs,
             'batch_size': batch_size,
             'patience': max(5, epochs // 5),
+            'n_folds': n_folds,
         }
+        
+        # Inject Optuna parameters if we tuned them!
+        if tuned_params:
+            print(f"  Injecting Optuna hyperparameters: {tuned_params}")
+            config.update(tuned_params)
+            
+            # Reset n_folds to 5 for the final ablation study (Optuna did 2)
+            if 'n_folds' in config:
+                del config['n_folds']
 
         all_results = train_all_models(data_dir, results_dir, config)
     else:
@@ -133,6 +221,10 @@ def main():
     parser.add_argument("--skip_benchmark", action="store_true")
     parser.add_argument("--quick", action="store_true",
                         help="Quick smoke test (2s data, 10 epochs)")
+    parser.add_argument("--tune", action="store_true",
+                        help="Run Optuna hyperparameter optimization prior to training")
+    parser.add_argument("--n_trials", type=int, default=20,
+                        help="Number of Optuna trials for hyperparameter tuning")
     args = parser.parse_args()
 
     run_full_pipeline(**vars(args))

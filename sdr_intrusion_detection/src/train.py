@@ -200,6 +200,7 @@ def train_model(
     data_dir: str,
     output_dir: str = "results/models",
     config: dict = None,
+    dataset: IQDataset = None,
 ) -> Dict:
     """
     Train a model with k-fold cross-validation.
@@ -229,14 +230,16 @@ def train_model(
 
     # --- Load dataset ---
     dual_input = is_dual_input(model_name)
-    is_spec_only = model_name == "cnn2d_spec"
 
-    iq_dataset = IQDataset(data_dir, window_size=WINDOW_SIZE)
-
-    if dual_input or is_spec_only:
-        dataset = MultiRepresentationDataset(iq_dataset, precompute_specs=True)
+    if dataset is not None:
+        iq_dataset = dataset
     else:
-        dataset = iq_dataset
+        # Load fresh if not provided
+        iq_dataset = IQDataset(data_dir, window_size=WINDOW_SIZE)
+
+    # IQDataset now returns dicts {'iq', 'spectrogram', 'label'}
+    # So we don't need MultiRepresentationDataset anymore.
+    dataset = iq_dataset
 
     # --- K-Fold CV ---
     skf = StratifiedKFold(
@@ -382,6 +385,7 @@ def train_svm_baseline(
     output_dir: str = "results/models",
     n_folds: int = 5,
     seed: int = 42,
+    dataset: IQDataset = None,
 ) -> Dict:
     """Train SVM on handcrafted statistical features."""
     set_seed(seed)
@@ -391,10 +395,14 @@ def train_svm_baseline(
     print(f"  Training: SVM Baseline (handcrafted features)")
     print(f"{'='*60}\n")
 
-    # Load data (Subsampled because RBF SVM is O(N^3) and takes days on 600,000 samples!)
-    dataset = IQDataset(data_dir, window_size=WINDOW_SIZE, max_windows_per_class=2000)
-    windows = dataset.windows     # [N, W, 2]
-    labels = dataset.labels       # [N]
+    # Load data
+    if dataset is not None:
+        ds = dataset
+    else:
+        ds = IQDataset(data_dir, window_size=WINDOW_SIZE, max_windows_per_class=2000)
+        
+    windows = ds.windows     # [N, W, 2]
+    labels = ds.labels       # [N]
 
     # Extract features
     print("  Computing statistical features...")
@@ -452,6 +460,7 @@ def train_spike_baseline(
     output_dir: str = "results/models",
     n_folds: int = 5,
     seed: int = 42,
+    dataset: IQDataset = None,
 ) -> Dict:
     """Train spike-based classifier (non-ML baseline)."""
     set_seed(seed)
@@ -461,10 +470,14 @@ def train_spike_baseline(
     print(f"  Training: Spike Detector Baseline (non-ML)")
     print(f"{'='*60}\n")
 
-    dataset = IQDataset(data_dir, window_size=WINDOW_SIZE,
-                        max_windows_per_class=500)  # Spike detection is slow
-    windows = dataset.windows
-    labels = dataset.labels
+    if dataset is not None:
+        ds = dataset
+    else:
+        ds = IQDataset(data_dir, window_size=WINDOW_SIZE,
+                       max_windows_per_class=500)
+    
+    windows = ds.windows
+    labels = ds.labels
 
     skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=seed)
     fold_accs = []
@@ -500,19 +513,22 @@ def train_spike_baseline(
 
 # ============================================================
 # Train All Models (for ablation study)
-# ============================================================
 def train_all_models(data_dir: str, output_dir: str = "results/models",
                      config: dict = None) -> Dict:
     """Train all models and compile comparison table."""
     all_results = {}
+    # 0. Load shared dataset once for all models
+    print(f"\n  [SHARED LOAD] Preparing dataset once for all models...")
+    # NOTE: We use full dataset for neural nets. Baselines will subsample IQ windows internally.
+    shared_dataset = IQDataset(data_dir, window_size=WINDOW_SIZE)
 
     # 1. Non-ML baselines
     print("\n" + "=" * 60)
     print("  PHASE 1: Non-ML Baselines")
     print("=" * 60)
 
-    all_results['spike_baseline'] = train_spike_baseline(data_dir, output_dir)
-    all_results['svm_baseline'] = train_svm_baseline(data_dir, output_dir)
+    all_results['spike_baseline'] = train_spike_baseline(data_dir, output_dir, dataset=shared_dataset)
+    all_results['svm_baseline'] = train_svm_baseline(data_dir, output_dir, dataset=shared_dataset)
 
     # 2. Neural network models
     print("\n" + "=" * 60)
@@ -525,7 +541,7 @@ def train_all_models(data_dir: str, output_dir: str = "results/models",
     for model_name in nn_models:
         try:
             all_results[model_name] = train_model(
-                model_name, data_dir, output_dir, config
+                model_name, data_dir, output_dir, config, dataset=shared_dataset
             )
         except Exception as e:
             print(f"  ❌ {model_name} failed: {e}")

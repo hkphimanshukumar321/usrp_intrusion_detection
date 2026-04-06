@@ -31,10 +31,10 @@ results/models/*.pth
 results/models/*.onnx
 *.ckpt
 
-# --- Results (regeneratable) ---
-results/figures/*.png
-results/figures/*.pdf
-results/figures/*.svg
+# # --- Results (regeneratable) ---
+# results/figures/*.png
+# results/figures/*.pdf
+# results/figures/*.svg
 
 # --- Jupyter ---
 .ipynb_checkpoints/
