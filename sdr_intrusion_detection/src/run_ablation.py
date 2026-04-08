@@ -134,6 +134,8 @@ def run_full_pipeline(
     n_trials: int = 20,
     n_folds: int = 5,
     extended_baselines: bool = False,
+    data_seed: int = 42,
+    scenarios_per_class: int = 12,
 ):
     """
     Run the complete pipeline: generate → tune → train → benchmark → evaluate.
@@ -158,6 +160,8 @@ def run_full_pipeline(
             output_dir=data_dir,
             duration_sec=duration,
             snr_db=snr_db,
+            seed=data_seed,
+            scenarios_per_class=scenarios_per_class,
         )
     else:
         print("\n  ⏩ Skipping data generation (--skip_data)")
@@ -283,6 +287,10 @@ def main():
                         help="Number of Optuna trials for hyperparameter tuning")
     parser.add_argument("--extended_baselines", action="store_true",
                         help="Include 10 additional torchvision spectrogram baselines")
+    parser.add_argument("--data_seed", type=int, default=42,
+                        help="Seed for scenario-based synthetic data generation")
+    parser.add_argument("--scenarios_per_class", type=int, default=12,
+                        help="Number of randomized scenarios to generate per class")
     args = parser.parse_args()
 
     run_full_pipeline(**vars(args))

@@ -33,7 +33,13 @@ from sklearn.metrics import accuracy_score, classification_report
 from collections import defaultdict
 from typing import Dict, List, Tuple, Optional
 
-from src.data_loader import IQDataset, IQAugmentation, CLASS_NAMES, WINDOW_SIZE
+from src.data_loader import (
+    IQDataset,
+    IQAugmentation,
+    CLASS_NAMES,
+    WINDOW_SIZE,
+    build_scenario_level_folds,
+)
 from src.feature_extraction import (
     compute_spectrogram_batch,
     compute_statistical_features_batch,
@@ -230,17 +236,26 @@ def train_model(
     dataset = iq_dataset
 
     # --- K-Fold CV ---
-    skf = StratifiedKFold(
-        n_splits=cfg['n_folds'], shuffle=True, random_state=cfg['seed']
-    )
     labels = iq_dataset.labels
+    if iq_dataset.scenario_ids is not None:
+        split_indices = build_scenario_level_folds(
+            labels,
+            iq_dataset.scenario_ids,
+            n_splits=cfg['n_folds'],
+            seed=cfg['seed'],
+        )
+        print(f"  Using scenario-level CV with {len(np.unique(iq_dataset.scenario_ids))} scenarios")
+    else:
+        skf = StratifiedKFold(
+            n_splits=cfg['n_folds'], shuffle=True, random_state=cfg['seed']
+        )
+        split_indices = list(skf.split(np.zeros(len(labels)), labels))
+        print("  Using window-level stratified CV (no scenario metadata found)")
 
     fold_results = []
     best_overall_acc = 0.0
 
-    for fold_idx, (train_idx, val_idx) in enumerate(
-        skf.split(np.zeros(len(labels)), labels)
-    ):
+    for fold_idx, (train_idx, val_idx) in enumerate(split_indices):
         print(f"\n--- Fold {fold_idx+1}/{cfg['n_folds']} ---")
 
         train_subset = Subset(dataset, train_idx)
@@ -346,6 +361,7 @@ def train_model(
         'fold_accuracies': fold_accs,
         'best_accuracy': best_overall_acc,
         'config': cfg,
+        'split_strategy': 'scenario_level' if iq_dataset.scenario_ids is not None else 'window_level',
         'fold_results': fold_results,
     }
 

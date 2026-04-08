@@ -1,3 +1,4 @@
+import json
 import os
 import numpy as np
 import torch
@@ -49,6 +50,45 @@ def iq_to_windows(
         windows[i, :, 1] = seg.imag
 
     return windows
+
+
+def load_dataset_manifest(data_dir: str) -> Optional[Dict]:
+    manifest_path = os.path.join(data_dir, "dataset_manifest.json")
+    if not os.path.exists(manifest_path):
+        return None
+    with open(manifest_path, "r") as f:
+        return json.load(f)
+
+
+def iq_to_windows_with_scenarios(
+    iq_data: np.ndarray,
+    scenario_entries: List[Dict],
+    window_size: int = WINDOW_SIZE,
+    overlap: float = OVERLAP,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Window each scenario independently so scenario boundaries do not leak."""
+    windows = []
+    scenario_ids = []
+
+    for entry in scenario_entries:
+        start = int(entry["start_sample"])
+        end = int(entry["end_sample"])
+        scenario_id = entry["scenario_id"]
+        segment = iq_data[start:end]
+        if len(segment) < window_size:
+            continue
+
+        seg_windows = iq_to_windows(segment, window_size, overlap)
+        windows.append(seg_windows)
+        scenario_ids.append(np.array([scenario_id] * len(seg_windows), dtype=object))
+
+    if not windows:
+        return (
+            np.empty((0, window_size, 2), dtype=np.float32),
+            np.empty((0,), dtype=object),
+        )
+
+    return np.concatenate(windows, axis=0), np.concatenate(scenario_ids, axis=0)
 
 
 def normalize_windows(windows: np.ndarray, method: str = "per_window") -> np.ndarray:
@@ -155,6 +195,36 @@ def segment_aware_split(
     return folds
 
 
+def build_scenario_level_folds(
+    labels: np.ndarray,
+    scenario_ids: np.ndarray,
+    n_splits: int,
+    seed: int = 42,
+) -> List[Tuple[np.ndarray, np.ndarray]]:
+    """Stratify by scenario, then expand scenarios back to window indices."""
+    unique_scenarios, first_indices = np.unique(scenario_ids, return_index=True)
+    scenario_labels = labels[first_indices]
+
+    min_class_scenarios = np.min(np.bincount(scenario_labels))
+    if min_class_scenarios < n_splits:
+        raise ValueError(
+            f"Not enough scenarios per class for {n_splits}-fold CV. "
+            f"Minimum scenarios in one class: {min_class_scenarios}"
+        )
+
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+    folds = []
+
+    for train_scenario_idx, val_scenario_idx in skf.split(unique_scenarios, scenario_labels):
+        train_scenarios = set(unique_scenarios[train_scenario_idx])
+        val_scenarios = set(unique_scenarios[val_scenario_idx])
+        train_idx = np.where(np.isin(scenario_ids, list(train_scenarios)))[0]
+        val_idx = np.where(np.isin(scenario_ids, list(val_scenarios)))[0]
+        folds.append((train_idx, val_idx))
+
+    return folds
+
+
 # ============================================================
 # PyTorch Dataset
 # ============================================================
@@ -190,6 +260,7 @@ class IQDataset(Dataset):
         self.overlap       = overlap
         self.transform     = transform
         self.precompute_stft = precompute_stft
+        self.manifest = load_dataset_manifest(data_dir)
 
         file_label_map = {
             "clear.dat":  0,
@@ -198,7 +269,7 @@ class IQDataset(Dataset):
             "drone.dat":  3,
         }
 
-        all_windows, all_labels = [], []
+        all_windows, all_labels, all_scenario_ids = [], [], []
 
         print("\nLoading datasets...")
         for filename, label in tqdm(file_label_map.items(), desc="Processing classes"):
@@ -208,14 +279,32 @@ class IQDataset(Dataset):
                 continue
 
             iq_data = load_dat_file(filepath)
-            windows = iq_to_windows(iq_data, window_size, overlap)
+            class_manifest = (
+                self.manifest.get("classes", {}).get(filename)
+                if self.manifest is not None
+                else None
+            )
+            if class_manifest and class_manifest.get("scenarios"):
+                windows, scenario_ids = iq_to_windows_with_scenarios(
+                    iq_data,
+                    class_manifest["scenarios"],
+                    window_size,
+                    overlap,
+                )
+            else:
+                windows = iq_to_windows(iq_data, window_size, overlap)
+                scenario_ids = None
 
             if max_windows_per_class and len(windows) > max_windows_per_class:
                 idx = np.random.choice(len(windows), max_windows_per_class, replace=False)
                 windows = windows[idx]
+                if scenario_ids is not None:
+                    scenario_ids = scenario_ids[idx]
 
             all_windows.append(windows)
             all_labels.append(np.full(len(windows), label, dtype=np.int64))
+            if scenario_ids is not None:
+                all_scenario_ids.append(scenario_ids)
             print(f"  Class {label} ({CLASS_NAMES[label]}): {len(windows):,} windows")
 
         if not all_windows:
@@ -229,6 +318,11 @@ class IQDataset(Dataset):
         self.labels_tensor  = torch.from_numpy(
             np.concatenate(all_labels, axis=0)
         )                                                    # [N]
+        self.scenario_ids_array = (
+            np.concatenate(all_scenario_ids, axis=0)
+            if len(all_scenario_ids) == len(all_windows)
+            else None
+        )
 
         # Precompute spectrograms once to avoid repeated STFT at batch time
         if self.precompute_stft:
@@ -241,6 +335,8 @@ class IQDataset(Dataset):
               f"IQ shape={tuple(self.windows_tensor.shape[1:])} | "
               f"Spec shape={tuple(self.specs_tensor.shape[1:]) if self.specs_tensor is not None else 'on-the-fly'}\n"
               f"{'='*50}\n")
+        if self.scenario_ids_array is not None:
+            print(f"  Scenario metadata detected: {len(np.unique(self.scenario_ids_array))} unique scenarios")
 
     @property
     def labels(self) -> np.ndarray:
@@ -249,6 +345,10 @@ class IQDataset(Dataset):
     @property
     def windows(self) -> np.ndarray:
         return self.windows_tensor.numpy()
+
+    @property
+    def scenario_ids(self) -> Optional[np.ndarray]:
+        return self.scenario_ids_array
 
     def __len__(self) -> int:
         return len(self.labels_tensor)
@@ -322,33 +422,37 @@ def get_kfold_loaders(
     Segment-aware stratified k-fold loaders.
     Splits by non-overlapping blocks to prevent window-level leakage.
     """
-    labels      = dataset.labels
-    num_windows = len(labels)
+    labels = dataset.labels
 
-    # Build per-class leakage-safe splits then merge
-    # Since classes are contiguous in the original load order,
-    # we split each class independently and union indices.
-    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
-    block_size = max(1, int(1 / (1 - dataset.overlap)))
-
-    # Group indices into blocks; assign block label = majority label in block
-    num_blocks = num_windows // block_size
-    block_labels = np.array([
-        labels[b * block_size] for b in range(num_blocks)
-    ])
+    if dataset.scenario_ids is not None:
+        fold_indices = build_scenario_level_folds(
+            labels,
+            dataset.scenario_ids,
+            n_splits=n_splits,
+            seed=seed,
+        )
+    else:
+        num_windows = len(labels)
+        skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+        block_size = max(1, int(1 / (1 - dataset.overlap)))
+        num_blocks = num_windows // block_size
+        block_labels = np.array([
+            labels[b * block_size] for b in range(num_blocks)
+        ])
+        fold_indices = []
+        for train_blk, val_blk in skf.split(np.zeros(num_blocks), block_labels):
+            train_idx = np.concatenate([
+                np.arange(b * block_size, min((b+1) * block_size, num_windows))
+                for b in train_blk
+            ])
+            val_idx = np.concatenate([
+                np.arange(b * block_size, min((b+1) * block_size, num_windows))
+                for b in val_blk
+            ])
+            fold_indices.append((train_idx, val_idx))
 
     folds = []
-    for fold_idx, (train_blk, val_blk) in enumerate(
-        skf.split(np.zeros(num_blocks), block_labels)
-    ):
-        train_idx = np.concatenate([
-            np.arange(b * block_size, min((b+1) * block_size, num_windows))
-            for b in train_blk
-        ])
-        val_idx = np.concatenate([
-            np.arange(b * block_size, min((b+1) * block_size, num_windows))
-            for b in val_blk
-        ])
+    for fold_idx, (train_idx, val_idx) in enumerate(fold_indices):
 
         train_loader = DataLoader(
             Subset(dataset, train_idx),
@@ -379,12 +483,13 @@ if __name__ == "__main__":
     ds = IQDataset(data_dir, max_windows_per_class=1000)
 
     # Verify dual-output shape
-    iq, spec, label = ds[0]
+    sample = ds[0]
+    iq, spec, label = sample["iq"], sample["spectrogram"], sample["label"]
     print(f"Sample: iq={iq.shape}, spec={spec.shape}, "
           f"label={label} ({CLASS_NAMES[label]})")
 
     # Verify loader yields correct batch structure
     folds = get_kfold_loaders(ds, n_splits=3, batch_size=64)
     train_loader, _ = folds[0]
-    batch_iq, batch_spec, batch_y = next(iter(train_loader))
-    print(f"Batch:  iq={batch_iq.shape}, spec={batch_spec.shape}, y={batch_y.shape}")
+    batch = next(iter(train_loader))
+    print(f"Batch:  iq={batch['iq'].shape}, spec={batch['spectrogram'].shape}, y={batch['label'].shape}")
