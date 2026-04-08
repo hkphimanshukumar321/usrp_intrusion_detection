@@ -8,7 +8,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 from src.data_loader import WINDOW_SIZE, STFT_N_FFT, STFT_HOP
 
 # Helper to calculate spectrogram dimensions to match compute_stft
-F_BINS = STFT_N_FFT // 2 + 1
+F_BINS = STFT_N_FFT
 T_BINS = 1 + WINDOW_SIZE // STFT_HOP
 
 @pytest.fixture

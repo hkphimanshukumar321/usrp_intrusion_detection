@@ -403,8 +403,9 @@ def plot_inference_benchmark(
 
     # Add labels
     for bar, t, p in zip(bars, cpu_times, params):
+        param_label = f'{p:,}' if isinstance(p, int) else str(p)
         ax.text(bar.get_width() + 0.1, bar.get_y() + bar.get_height() / 2,
-                f'{t:.2f}ms | {p:,} params', va='center', fontsize=9)
+                f'{t:.2f}ms | {param_label} params', va='center', fontsize=9)
 
     fig.tight_layout()
     fig.savefig(output_path)

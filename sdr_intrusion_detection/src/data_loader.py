@@ -88,10 +88,8 @@ def compute_stft_batch(
     """
     Vectorized STFT computation for a batch of windows.
     """
-    # Move signal to complex-ready format
-    I = iq_windows[..., 0]
-    Q = iq_windows[..., 1]
-    signal = torch.sqrt(I ** 2 + Q ** 2)   # [N, W]
+    # Preserve the true complex IQ structure instead of collapsing to amplitude.
+    signal = torch.complex(iq_windows[..., 0], iq_windows[..., 1])  # [N, W]
 
     stft = torch.stft(
         signal,
@@ -100,10 +98,15 @@ def compute_stft_batch(
         win_length=n_fft,
         window=torch.hann_window(n_fft).to(signal.device),
         return_complex=True,
-        center=True
+        center=True,
+        onesided=False,
     )                                        # [N, F, T]
 
     log_power = torch.log1p(stft.abs() ** 2)
+    flat = log_power.flatten(1)
+    mins = flat.min(dim=1).values.view(-1, 1, 1)
+    maxs = flat.max(dim=1).values.view(-1, 1, 1)
+    log_power = (log_power - mins) / (maxs - mins + 1e-6)
     return log_power.unsqueeze(1)            # [N, 1, F, T]
 
 

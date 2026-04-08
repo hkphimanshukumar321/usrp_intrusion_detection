@@ -16,17 +16,26 @@ Each model exposes:
   - count_params() → total trainable parameters
 """
 
+from functools import partial
+import math
+from typing import Optional, Dict, Tuple
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Dict, Tuple
-import math
+from torchvision import models as tv_models
+
+from src.data_loader import (
+    STFT_HOP,
+    STFT_N_FFT,
+    WINDOW_SIZE as DATA_WINDOW_SIZE,
+)
 
 
 NUM_CLASSES = 4
-WINDOW_SIZE = 256
-SPEC_FREQ_BINS = 128    # nfft
-SPEC_TIME_BINS = 17     # depends on window_size, nperseg, noverlap
+WINDOW_SIZE = DATA_WINDOW_SIZE
+SPEC_FREQ_BINS = STFT_N_FFT
+SPEC_TIME_BINS = 1 + WINDOW_SIZE // STFT_HOP
 
 
 # ============================================================
@@ -191,6 +200,53 @@ class ResidualBlock2D(nn.Module):
         out += self.shortcut(x)
         out = self.relu(out)
         return out
+
+
+class DepthwiseSeparableConv2D(nn.Module):
+    """Depthwise-separable 2D block for a stronger but cheaper spectrogram branch."""
+
+    def __init__(self, in_ch, out_ch, stride=1):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(
+                in_ch,
+                in_ch,
+                kernel_size=3,
+                stride=stride,
+                padding=1,
+                groups=in_ch,
+                bias=False,
+            ),
+            nn.BatchNorm2d(in_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_ch, out_ch, kernel_size=1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x):
+        return self.block(x)
+
+
+class ConcatResidualFusion(nn.Module):
+    """Fuse branch embeddings with concat -> MLP plus a residual projection."""
+
+    def __init__(self, iq_dim: int, spec_dim: int, out_dim: int, dropout: float = 0.15):
+        super().__init__()
+        fused_dim = iq_dim + spec_dim
+        hidden_dim = max(out_dim, fused_dim // 2)
+        self.residual = nn.Linear(fused_dim, out_dim, bias=False)
+        self.mlp = nn.Sequential(
+            nn.Linear(fused_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, out_dim),
+        )
+        self.norm = nn.LayerNorm(out_dim)
+
+    def forward(self, iq_feat: torch.Tensor, spec_feat: torch.Tensor) -> torch.Tensor:
+        fused = torch.cat([iq_feat, spec_feat], dim=1)
+        return self.norm(self.residual(fused) + self.mlp(fused))
 
 class GatedFusion(nn.Module):
     """Gated Attention fusion of time (1D) and frequency (2D) features"""
@@ -458,6 +514,77 @@ class DualBranchFusionCNN(nn.Module):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
 
+class SpectrogramBackboneClassifier(nn.Module):
+    """
+    Torchvision image backbones adapted for single-channel spectrogram input.
+
+    The input spectrogram is upsampled to an ImageNet-like resolution and lifted
+    from 1 to 3 channels so standard classification backbones can be reused
+    without architecture-specific stem surgery.
+    """
+
+    def __init__(
+        self,
+        backbone_name: str,
+        num_classes: int = NUM_CLASSES,
+        resize_to: Tuple[int, int] = (224, 224),
+    ):
+        super().__init__()
+        self.backbone_name = backbone_name
+        self.resize_to = resize_to
+        self.input_adapter = nn.Sequential(
+            nn.Upsample(size=resize_to, mode="bilinear", align_corners=False),
+            nn.Conv2d(1, 3, kernel_size=1, bias=False),
+            nn.BatchNorm2d(3),
+            nn.ReLU(inplace=True),
+        )
+        self.backbone, feature_dim = self._build_backbone(backbone_name)
+        self.classifier = nn.Linear(feature_dim, num_classes)
+
+    def _build_backbone(self, backbone_name: str) -> Tuple[nn.Module, int]:
+        if backbone_name.startswith("resnet") or backbone_name.startswith("wide_resnet"):
+            backbone = getattr(tv_models, backbone_name)(weights=None)
+            feature_dim = backbone.fc.in_features
+            backbone.fc = nn.Identity()
+            return backbone, feature_dim
+
+        if backbone_name.startswith("densenet"):
+            backbone = getattr(tv_models, backbone_name)(weights=None)
+            feature_dim = backbone.classifier.in_features
+            backbone.classifier = nn.Identity()
+            return backbone, feature_dim
+
+        if backbone_name.startswith("mobilenet"):
+            backbone = getattr(tv_models, backbone_name)(weights=None)
+            feature_dim = backbone.classifier[-1].in_features
+            backbone.classifier = nn.Identity()
+            return backbone, feature_dim
+
+        if backbone_name.startswith("efficientnet"):
+            backbone = getattr(tv_models, backbone_name)(weights=None)
+            feature_dim = backbone.classifier[-1].in_features
+            backbone.classifier = nn.Identity()
+            return backbone, feature_dim
+
+        raise ValueError(f"Unsupported spectrogram backbone: {backbone_name}")
+
+    def _extract_features(self, spec: torch.Tensor) -> torch.Tensor:
+        spec = self.input_adapter(spec)
+        features = self.backbone(spec)
+        if features.ndim > 2:
+            features = torch.flatten(features, 1)
+        return features
+
+    def forward(self, spec: torch.Tensor) -> torch.Tensor:
+        return self.classifier(self._extract_features(spec))
+
+    def get_features(self, spec: torch.Tensor) -> torch.Tensor:
+        return self._extract_features(spec)
+
+    def count_params(self):
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+
 # ============================================================
 # Model 5: DualBranchLite — Lightweight for Edge Devices
 # ============================================================
@@ -614,55 +741,53 @@ class CrossModalAttention(nn.Module):
 
 class DualBranchFusionCNN(nn.Module):
     """
-    Dual-branch CNN with Gated Feature Fusion for RF intrusion detection.
-    
-    Branch 1: 1D ResNet on complex-encoded IQ [B, W, 2] + CBAM1D
-    Branch 2: 2D ResNet + CBAM on STFT spectrogram [B, 1, F, T]
-    Cross-Modal: Bidirectional cross-attention on intermediate feature maps (pre-pool)
-    Fusion:   Gated Attention Fusion -> MLP -> num_classes softmax
+    Dual-branch CNN with efficient concat-residual fusion for RF intrusion detection.
+
+    Branch 1: compact 1D encoder on complex-encoded IQ [B, W, 2] + CBAM1D
+    Branch 2: stronger depthwise-separable spectrogram encoder + SE/CBAM
+    Fusion:   concat([iq_feat, spec_feat]) -> residual MLP projection -> logits
     """
 
     def __init__(
         self,
         window_size: int = WINDOW_SIZE,
         num_classes: int = NUM_CLASSES,
-        branch_dim: int = 128,          # Single dim arg — both branches must match for GatedFusion
-        fusion_dim: int = 128,
-        dropout: float = 0.3,
+        branch_dim: int = 64,
+        spec_branch_dim: Optional[int] = None,
+        fusion_dim: int = 64,
+        dropout: float = 0.15,
     ):
         super().__init__()
 
         assert branch_dim > 0, "branch_dim must be a positive integer"
-        dim = branch_dim
+        iq_dim = branch_dim
+        spec_dim = spec_branch_dim or max(branch_dim, 80)
 
-        # --- Branch 1: 1D ResNet on complex-encoded IQ ---
-        self.iq_encoder = ComplexEncoder()          # [B, W, 2] -> [B, 4, W]
-        self.iq_branch  = nn.Sequential(
-            ConvBNReLU1D(4, 32, kernel_size=7, stride=2, padding=3),
-            ResidualBlock1D(32, 64,  kernel_size=5, stride=2, padding=2),
-            ResidualBlock1D(64, dim, kernel_size=3, stride=2, padding=1),
+        # --- Branch 1: compact IQ encoder ---
+        self.iq_encoder = ComplexEncoder()
+        self.iq_branch = nn.Sequential(
+            ConvBNReLU1D(4, 24, kernel_size=7, stride=2, padding=3),
+            ResidualBlock1D(24, 48, kernel_size=5, stride=2, padding=2),
+            ResidualBlock1D(48, iq_dim, kernel_size=3, stride=2, padding=1),
         )
-        self.iq_attn = CBAM1D(dim)                  # Symmetric attention (matches Branch 2)
+        self.iq_attn = CBAM1D(iq_dim, reduction=8)
+        self.iq_pool = nn.Sequential(nn.AdaptiveAvgPool1d(1), nn.Flatten())
 
-        # --- Branch 2: 2D ResNet on Spectrogram ---
+        # --- Branch 2: stronger spectrogram encoder at lower cost ---
         self.spec_branch = nn.Sequential(
-            ConvBNReLU2D(1, 32, kernel_size=3, stride=2, padding=1),
-            ResidualBlock2D(32, 64,  kernel_size=3, stride=2, padding=1),
-            ResidualBlock2D(64, dim, kernel_size=3, stride=2, padding=1),
+            ConvBNReLU2D(1, 24, kernel_size=3, stride=2, padding=1),
+            DepthwiseSeparableConv2D(24, 48, stride=2),
+            DepthwiseSeparableConv2D(48, 64, stride=1),
+            DepthwiseSeparableConv2D(64, spec_dim, stride=2),
+            SEBlock2D(spec_dim, reduction=8),
+            ConvBNReLU2D(spec_dim, spec_dim, kernel_size=3, padding=1),
         )
-        self.spec_attn = CBAM(dim)                  # Spatial + Channel
-
-        # --- Cross-Modal Attention (before pooling, preserves spatial structure) ---
-        self.cross_attn = CrossModalAttention(dim)
-
-        # --- Pooling ---
-        self.iq_pool   = nn.Sequential(nn.AdaptiveAvgPool1d(1), nn.Flatten())
+        self.spec_attn = CBAM(spec_dim, ratio=8)
         self.spec_pool = nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Flatten())
 
-        # --- Fusion & Classification Head ---
-        self.gated_fusion = GatedFusion(dim)
-        self.fusion_head  = nn.Sequential(
-            nn.Linear(dim, fusion_dim),
+        # --- Concat-residual fusion head ---
+        self.fusion = ConcatResidualFusion(iq_dim, spec_dim, fusion_dim, dropout=dropout)
+        self.fusion_head = nn.Sequential(
             nn.ReLU(inplace=True),
             nn.Dropout(dropout),
             nn.Linear(fusion_dim, 64),
@@ -672,18 +797,10 @@ class DualBranchFusionCNN(nn.Module):
         self.output = nn.Linear(64, num_classes)
 
     def _extract_features(self, iq: torch.Tensor, spec: torch.Tensor) -> torch.Tensor:
-        # Branch 1
-        iq_maps  = self.iq_attn(self.iq_branch(self.iq_encoder(iq)))    # [B, dim, L]
-
-        # Branch 2
-        spec_maps = self.spec_attn(self.spec_branch(spec))               # [B, dim, F', T']
-
-        # Cross-modal attention on feature maps (before global pooling)
-        iq_maps, spec_maps = self.cross_attn(iq_maps, spec_maps)
-
-        # Pool -> fuse
-        fused = self.gated_fusion(self.iq_pool(iq_maps), self.spec_pool(spec_maps))
-        return self.fusion_head(fused)                                    # [B, 64]
+        iq_maps = self.iq_attn(self.iq_branch(self.iq_encoder(iq)))
+        spec_maps = self.spec_attn(self.spec_branch(spec))
+        fused = self.fusion(self.iq_pool(iq_maps), self.spec_pool(spec_maps))
+        return self.fusion_head(fused)
 
     def forward(self, iq: torch.Tensor, spec: torch.Tensor) -> torch.Tensor:
         """
@@ -696,7 +813,7 @@ class DualBranchFusionCNN(nn.Module):
         return self.output(self._extract_features(iq, spec))
 
     def get_features(self, iq: torch.Tensor, spec: torch.Tensor) -> torch.Tensor:
-        """Extract 64-dim fused embedding (for t-SNE / probing)."""
+        """Extract the fused embedding before the final classifier."""
         return self._extract_features(iq, spec)
 
     def count_params(self):
@@ -705,15 +822,60 @@ class DualBranchFusionCNN(nn.Module):
 # ============================================================
 # Model Registry
 # ============================================================
+EXTENDED_SPECTROGRAM_MODELS = [
+    "resnet18_spec",
+    "resnet34_spec",
+    "resnet50_spec",
+    "wide_resnet50_2_spec",
+    "mobilenet_v2_spec",
+    "mobilenet_v3_small_spec",
+    "mobilenet_v3_large_spec",
+    "efficientnet_b0_spec",
+    "efficientnet_v2_s_spec",
+    "densenet121_spec",
+]
+
 MODEL_REGISTRY = {
     "mlp_baseline": MLPBaseline,
     "cnn1d_iq": CNN1D_IQ,
     "cnn2d_spec": CNN2D_Spec,
     "dual_branch_fusion": DualBranchFusionCNN,
     "dual_branch_lite": DualBranchLite,
+    "resnet18_spec": partial(SpectrogramBackboneClassifier, backbone_name="resnet18"),
+    "resnet34_spec": partial(SpectrogramBackboneClassifier, backbone_name="resnet34"),
+    "resnet50_spec": partial(SpectrogramBackboneClassifier, backbone_name="resnet50"),
+    "wide_resnet50_2_spec": partial(
+        SpectrogramBackboneClassifier,
+        backbone_name="wide_resnet50_2",
+    ),
+    "mobilenet_v2_spec": partial(
+        SpectrogramBackboneClassifier,
+        backbone_name="mobilenet_v2",
+    ),
+    "mobilenet_v3_small_spec": partial(
+        SpectrogramBackboneClassifier,
+        backbone_name="mobilenet_v3_small",
+    ),
+    "mobilenet_v3_large_spec": partial(
+        SpectrogramBackboneClassifier,
+        backbone_name="mobilenet_v3_large",
+    ),
+    "efficientnet_b0_spec": partial(
+        SpectrogramBackboneClassifier,
+        backbone_name="efficientnet_b0",
+    ),
+    "efficientnet_v2_s_spec": partial(
+        SpectrogramBackboneClassifier,
+        backbone_name="efficientnet_v2_s",
+    ),
+    "densenet121_spec": partial(
+        SpectrogramBackboneClassifier,
+        backbone_name="densenet121",
+    ),
 }
 
 DUAL_INPUT_MODELS = {"dual_branch_fusion", "dual_branch_lite"}
+SPECTROGRAM_ONLY_MODELS = {"cnn2d_spec", *EXTENDED_SPECTROGRAM_MODELS}
 
 
 def build_model(name: str, **kwargs) -> nn.Module:
@@ -727,6 +889,20 @@ def build_model(name: str, **kwargs) -> nn.Module:
 def is_dual_input(name: str) -> bool:
     """Check if a model requires both IQ and spectrogram inputs."""
     return name in DUAL_INPUT_MODELS
+
+
+def is_spectrogram_only(name: str) -> bool:
+    """Check if a model consumes only spectrogram input."""
+    return name in SPECTROGRAM_ONLY_MODELS
+
+
+def get_model_input_mode(name: str) -> str:
+    """Return one of: 'iq', 'spectrogram', 'dual'."""
+    if is_dual_input(name):
+        return "dual"
+    if is_spectrogram_only(name):
+        return "spectrogram"
+    return "iq"
 
 
 # ============================================================
@@ -743,9 +919,12 @@ def print_model_summary():
     for name, cls in MODEL_REGISTRY.items():
         model = cls()
         n_params = model.count_params()
-        input_type = "IQ + Spec" if name in DUAL_INPUT_MODELS else "IQ only"
-        if name in ["cnn2d_spec"]:
-            input_type = "Spec only"
+        input_mode = get_model_input_mode(name)
+        input_type = {
+            "dual": "IQ + Spec",
+            "spectrogram": "Spec only",
+            "iq": "IQ only",
+        }[input_mode]
         print(f"  {name:<25} {n_params:>12,} {input_type:>20}")
 
     print(f"{'='*60}\n")
@@ -765,12 +944,13 @@ if __name__ == "__main__":
     for name, cls in MODEL_REGISTRY.items():
         model = cls()
         model.eval()
+        input_mode = get_model_input_mode(name)
 
         with torch.no_grad():
-            if name in DUAL_INPUT_MODELS:
+            if input_mode == "dual":
                 logits = model(iq, spec)
                 features = model.get_features(iq, spec)
-            elif name in ["cnn2d_spec"]:
+            elif input_mode == "spectrogram":
                 logits = model(spec)
                 features = model.get_features(spec)
             else:

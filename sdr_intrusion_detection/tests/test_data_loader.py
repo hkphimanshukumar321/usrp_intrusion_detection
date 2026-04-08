@@ -35,14 +35,14 @@ def test_compute_stft(dummy_iq_batch):
     
     spec = compute_stft(iq_window, n_fft=STFT_N_FFT, hop_length=STFT_HOP)
     
-    # F = n_fft // 2 + 1
+    # F = n_fft because compute_stft keeps the full complex spectrum.
     # T = 1 + W // hop_length
-    F_expected = STFT_N_FFT // 2 + 1
+    F_expected = STFT_N_FFT
     T_expected = 1 + WINDOW_SIZE // STFT_HOP
     
     assert spec.shape == (1, F_expected, T_expected), "STFT generated an incorrect spectrogram shape."
     
-    # Ensure there are no mathematically invalid NaNs or negatives (it's log-power)
+    # Ensure there are no mathematically invalid NaNs or negatives.
     assert not torch.isnan(spec).any(), "NaN found in STFT."
     assert torch.min(spec) >= 0.0, "Negative values found in log-power STFT."
 

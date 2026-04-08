@@ -1,11 +1,14 @@
 import torch
+import pytest
 from src.model import (
-    ComplexEncoder, 
-    CBAM1D, 
-    CrossModalAttention, 
-    DualBranchFusionCNN, 
-    NUM_CLASSES, 
-    WINDOW_SIZE
+    CBAM1D,
+    ComplexEncoder,
+    CrossModalAttention,
+    DualBranchFusionCNN,
+    NUM_CLASSES,
+    WINDOW_SIZE,
+    build_model,
+    get_model_input_mode,
 )
 
 def test_complex_encoder(dummy_iq_batch):
@@ -79,3 +82,29 @@ def test_dual_branch_fusion_get_features(dummy_iq_batch, dummy_spec_batch):
     
     B = dummy_iq_batch.shape[0]
     assert features.shape == (B, 64), "get_features must return exactly the fusion_dim size [B, 64] before the final layer"
+
+
+def test_dual_branch_fusion_is_compact():
+    """The SOTA fusion model should stay below the old heavy baseline size."""
+    fusion_params = build_model("dual_branch_fusion").count_params()
+    cnn1d_params = build_model("cnn1d_iq").count_params()
+
+    assert fusion_params < cnn1d_params
+
+
+@pytest.mark.parametrize(
+    "model_name",
+    ["mobilenet_v2_spec", "resnet18_spec", "densenet121_spec", "efficientnet_v2_s_spec"],
+)
+def test_extended_spectrogram_backbones_forward(model_name, dummy_spec_batch):
+    """Extended spectrogram baselines should accept [B, 1, F, T] tensors."""
+    model = build_model(model_name)
+    assert get_model_input_mode(model_name) == "spectrogram"
+    spec_batch = dummy_spec_batch[:1]
+
+    with torch.no_grad():
+        logits = model(spec_batch)
+        features = model.get_features(spec_batch)
+
+    assert logits.shape == (spec_batch.shape[0], NUM_CLASSES)
+    assert features.ndim == 2

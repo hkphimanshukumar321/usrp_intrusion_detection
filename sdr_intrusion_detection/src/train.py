@@ -19,6 +19,7 @@ Usage:
 import argparse
 import json
 import os
+import pickle
 import time
 import numpy as np
 import torch
@@ -41,7 +42,8 @@ from src.feature_extraction import (
 from src.spike_detector import SpikeBasedClassifier
 from src.model import (
     build_model, is_dual_input, MODEL_REGISTRY,
-    DUAL_INPUT_MODELS, print_model_summary,
+    DUAL_INPUT_MODELS, EXTENDED_SPECTROGRAM_MODELS,
+    get_model_input_mode, print_model_summary,
 )
 
 
@@ -75,6 +77,30 @@ def set_seed(seed: int):
         torch.cuda.manual_seed_all(seed)
 
 
+def prepare_model_inputs(
+    batch,
+    device: torch.device,
+    input_mode: str,
+) -> Tuple[Tuple[torch.Tensor, ...], torch.Tensor]:
+    """Route a batch to the right input signature for the selected model."""
+    if isinstance(batch, dict):
+        labels = batch['label'].to(device)
+
+        if input_mode == 'dual':
+            return (
+                batch['iq'].to(device),
+                batch['spectrogram'].to(device),
+            ), labels
+
+        if input_mode == 'spectrogram':
+            return (batch['spectrogram'].to(device),), labels
+
+        return (batch['iq'].to(device),), labels
+
+    inputs, labels = batch
+    return (inputs.to(device),), labels.to(device)
+
+
 # ============================================================
 # Single Epoch Training
 # ============================================================
@@ -84,7 +110,7 @@ def train_one_epoch(
     criterion: nn.Module,
     optimizer: optim.Optimizer,
     device: torch.device,
-    dual_input: bool = False,
+    input_mode: str = 'iq',
 ) -> Tuple[float, float]:
     """Train for one epoch, return (loss, accuracy)."""
     model.train()
@@ -93,35 +119,8 @@ def train_one_epoch(
     total = 0
 
     for batch in loader:
-        if dual_input:
-            iq = batch['iq'].to(device)
-            spec = batch['spectrogram'].to(device)
-            labels = batch['label'].to(device)
-            logits = model(iq, spec)
-        else:
-            if isinstance(batch, dict):
-                inputs = batch['iq'].to(device)
-                labels = batch['label'].to(device)
-            else:
-                inputs, labels = batch
-                inputs = inputs.to(device)
-                labels = labels.to(device)
-
-            # Route to correct model input
-            if hasattr(model, 'encoder') and isinstance(
-                list(model.children())[0], nn.Sequential
-            ):
-                # Check if model expects spectrogram
-                first_conv = None
-                for m in model.modules():
-                    if isinstance(m, (nn.Conv1d, nn.Conv2d)):
-                        first_conv = m
-                        break
-                if first_conv and isinstance(first_conv, nn.Conv2d):
-                    # 2D model expects spectrogram — skip for now
-                    continue
-
-            logits = model(inputs)
+        inputs, labels = prepare_model_inputs(batch, device, input_mode)
+        logits = model(*inputs)
 
         loss = criterion(logits, labels)
 
@@ -149,7 +148,7 @@ def validate(
     loader: DataLoader,
     criterion: nn.Module,
     device: torch.device,
-    dual_input: bool = False,
+    input_mode: str = 'iq',
 ) -> Tuple[float, float, np.ndarray, np.ndarray]:
     """Validate model, return (loss, accuracy, all_preds, all_labels)."""
     model.eval()
@@ -160,20 +159,8 @@ def validate(
     all_labels = []
 
     for batch in loader:
-        if dual_input:
-            iq = batch['iq'].to(device)
-            spec = batch['spectrogram'].to(device)
-            labels = batch['label'].to(device)
-            logits = model(iq, spec)
-        else:
-            if isinstance(batch, dict):
-                inputs = batch['iq'].to(device)
-                labels = batch['label'].to(device)
-            else:
-                inputs, labels = batch
-                inputs = inputs.to(device)
-                labels = labels.to(device)
-            logits = model(inputs)
+        inputs, labels = prepare_model_inputs(batch, device, input_mode)
+        logits = model(*inputs)
 
         loss = criterion(logits, labels)
         total_loss += loss.item() * labels.size(0)
@@ -218,6 +205,7 @@ def train_model(
     set_seed(cfg['seed'])
     device = get_device(cfg['device'])
     os.makedirs(output_dir, exist_ok=True)
+    model_kwargs = cfg.get('model_kwargs', {})
 
     print(f"\n{'='*60}")
     print(f"  Training: {model_name}")
@@ -229,7 +217,7 @@ def train_model(
     print(f"{'='*60}\n")
 
     # --- Load dataset ---
-    dual_input = is_dual_input(model_name)
+    input_mode = get_model_input_mode(model_name)
 
     if dataset is not None:
         iq_dataset = dataset
@@ -268,7 +256,7 @@ def train_model(
         )
 
         # Build fresh model for each fold
-        model = build_model(model_name).to(device)
+        model = build_model(model_name, **model_kwargs).to(device)
         criterion = nn.CrossEntropyLoss(label_smoothing=cfg['label_smoothing'])
         optimizer = optim.AdamW(
             model.parameters(), lr=cfg['lr'], weight_decay=cfg['weight_decay']
@@ -287,10 +275,10 @@ def train_model(
             t0 = time.time()
 
             train_loss, train_acc = train_one_epoch(
-                model, train_loader, criterion, optimizer, device, dual_input
+                model, train_loader, criterion, optimizer, device, input_mode
             )
             val_loss, val_acc, val_preds, val_labels = validate(
-                model, val_loader, criterion, device, dual_input
+                model, val_loader, criterion, device, input_mode
             )
             scheduler.step(val_loss)
 
@@ -352,7 +340,7 @@ def train_model(
 
     results = {
         'model_name': model_name,
-        'num_params': build_model(model_name).count_params(),
+        'num_params': build_model(model_name, **model_kwargs).count_params(),
         'mean_accuracy': mean_acc,
         'std_accuracy': std_acc,
         'fold_accuracies': fold_accs,
@@ -397,12 +385,22 @@ def train_svm_baseline(
 
     # Load data
     if dataset is not None:
-        ds = dataset
+        windows = dataset.windows
+        labels = dataset.labels
+        # Subsample to avoid intractable training times with full dataset
+        idx_list = []
+        for cls in np.unique(labels):
+            cls_idx = np.where(labels == cls)[0]
+            if len(cls_idx) > 2000:
+                cls_idx = np.random.choice(cls_idx, 2000, replace=False)
+            idx_list.append(cls_idx)
+        idx = np.concatenate(idx_list)
+        windows = windows[idx]
+        labels = labels[idx]
     else:
         ds = IQDataset(data_dir, window_size=WINDOW_SIZE, max_windows_per_class=2000)
-        
-    windows = ds.windows     # [N, W, 2]
-    labels = ds.labels       # [N]
+        windows = ds.windows     # [N, W, 2]
+        labels = ds.labels       # [N]
 
     # Extract features
     print("  Computing statistical features...")
@@ -444,6 +442,22 @@ def train_svm_baseline(
         'feature_dim': features.shape[1],
     }
 
+    # Fit once on the full subsampled dataset so inference can be benchmarked later.
+    final_scaler = StandardScaler()
+    features_scaled = final_scaler.fit_transform(features)
+    final_svm = SVC(kernel='rbf', C=10.0, gamma='scale', random_state=seed)
+    final_svm.fit(features_scaled, labels)
+    artifact = {
+        'scaler': final_scaler,
+        'model': final_svm,
+        'feature_dim': int(features.shape[1]),
+    }
+    artifact_path = os.path.join(output_dir, "svm_baseline_artifact.pkl")
+    with open(artifact_path, 'wb') as f:
+        pickle.dump(artifact, f)
+    results['artifact_path'] = artifact_path
+    results['artifact_size_kb'] = os.path.getsize(artifact_path) / 1024
+
     results_path = os.path.join(output_dir, "svm_baseline_results.json")
     with open(results_path, 'w') as f:
         json.dump(results, f, indent=2, default=str)
@@ -471,13 +485,23 @@ def train_spike_baseline(
     print(f"{'='*60}\n")
 
     if dataset is not None:
-        ds = dataset
+        windows = dataset.windows
+        labels = dataset.labels
+        # Subsample for pure-python spike detector
+        idx_list = []
+        for cls in np.unique(labels):
+            cls_idx = np.where(labels == cls)[0]
+            if len(cls_idx) > 500:
+                cls_idx = np.random.choice(cls_idx, 500, replace=False)
+            idx_list.append(cls_idx)
+        idx = np.concatenate(idx_list)
+        windows = windows[idx]
+        labels = labels[idx]
     else:
         ds = IQDataset(data_dir, window_size=WINDOW_SIZE,
                        max_windows_per_class=500)
-    
-    windows = ds.windows
-    labels = ds.labels
+        windows = ds.windows
+        labels = ds.labels
 
     skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=seed)
     fold_accs = []
@@ -503,6 +527,15 @@ def train_spike_baseline(
         'fold_accuracies': fold_accs,
     }
 
+    # Fit a final deployable artifact on the full subsampled dataset for benchmarking.
+    final_clf = SpikeBasedClassifier()
+    final_clf.fit(windows, labels)
+    artifact_path = os.path.join(output_dir, "spike_baseline_artifact.pkl")
+    with open(artifact_path, 'wb') as f:
+        pickle.dump(final_clf, f)
+    results['artifact_path'] = artifact_path
+    results['artifact_size_kb'] = os.path.getsize(artifact_path) / 1024
+
     results_path = os.path.join(output_dir, "spike_baseline_results.json")
     with open(results_path, 'w') as f:
         json.dump(results, f, indent=2, default=str)
@@ -513,8 +546,12 @@ def train_spike_baseline(
 
 # ============================================================
 # Train All Models (for ablation study)
-def train_all_models(data_dir: str, output_dir: str = "results/models",
-                     config: dict = None) -> Dict:
+def train_all_models(
+    data_dir: str,
+    output_dir: str = "results/models",
+    config: dict = None,
+    include_extended_baselines: bool = False,
+) -> Dict:
     """Train all models and compile comparison table."""
     all_results = {}
     # 0. Load shared dataset once for all models
@@ -537,6 +574,8 @@ def train_all_models(data_dir: str, output_dir: str = "results/models",
 
     nn_models = ['mlp_baseline', 'cnn1d_iq', 'cnn2d_spec',
                  'dual_branch_fusion', 'dual_branch_lite']
+    if include_extended_baselines:
+        nn_models.extend(EXTENDED_SPECTROGRAM_MODELS)
 
     for model_name in nn_models:
         try:
@@ -601,6 +640,8 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--train_all", action="store_true",
                         help="Train all models for ablation study")
+    parser.add_argument("--extended_baselines", action="store_true",
+                        help="Include 10 additional torchvision spectrogram baselines")
     parser.add_argument("--show_models", action="store_true",
                         help="Print model architecture summary")
 
@@ -620,7 +661,12 @@ def main():
     }
 
     if args.train_all:
-        train_all_models(args.data_dir, args.output_dir, config)
+        train_all_models(
+            args.data_dir,
+            args.output_dir,
+            config,
+            include_extended_baselines=args.extended_baselines,
+        )
     elif args.model == 'svm':
         train_svm_baseline(args.data_dir, args.output_dir)
     elif args.model == 'spike':

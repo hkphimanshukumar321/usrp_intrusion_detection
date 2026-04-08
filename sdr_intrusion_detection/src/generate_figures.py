@@ -50,6 +50,16 @@ MODEL_DISPLAY = {
     "cnn2d_spec":          "2D-CNN (Spec.)",
     "dual_branch_fusion":  "Dual-Branch Fusion",
     "dual_branch_lite":    "Dual-Branch Lite",
+    "resnet18_spec":       "ResNet-18",
+    "resnet34_spec":       "ResNet-34",
+    "resnet50_spec":       "ResNet-50",
+    "wide_resnet50_2_spec":"Wide-ResNet-50-2",
+    "mobilenet_v2_spec":   "MobileNetV2",
+    "mobilenet_v3_small_spec": "MobileNetV3-S",
+    "mobilenet_v3_large_spec": "MobileNetV3-L",
+    "efficientnet_b0_spec":"EffNet-B0",
+    "efficientnet_v2_s_spec":"EffNetV2-S",
+    "densenet121_spec":    "DenseNet-121",
 }
 
 # Curated color palette — distinguishable in print & screen
@@ -61,6 +71,16 @@ MODEL_COLORS = {
     "cnn2d_spec":          "#ef5350",
     "dual_branch_fusion":  "#1565c0",
     "dual_branch_lite":    "#ff8f00",
+    "resnet18_spec":       "#2e7d32",
+    "resnet34_spec":       "#558b2f",
+    "resnet50_spec":       "#7cb342",
+    "wide_resnet50_2_spec":"#9ccc65",
+    "mobilenet_v2_spec":   "#6a1b9a",
+    "mobilenet_v3_small_spec": "#8e24aa",
+    "mobilenet_v3_large_spec": "#ab47bc",
+    "efficientnet_b0_spec":"#00838f",
+    "efficientnet_v2_s_spec":"#00acc1",
+    "densenet121_spec":    "#3949ab",
 }
 
 # Marker styles for line plots
@@ -72,6 +92,16 @@ MODEL_MARKERS = {
     "cnn2d_spec":          "D",
     "dual_branch_fusion":  "P",
     "dual_branch_lite":    "*",
+    "resnet18_spec":       "h",
+    "resnet34_spec":       "H",
+    "resnet50_spec":       "X",
+    "wide_resnet50_2_spec":"8",
+    "mobilenet_v2_spec":   "<",
+    "mobilenet_v3_small_spec": ">",
+    "mobilenet_v3_large_spec": "p",
+    "efficientnet_b0_spec":"d",
+    "efficientnet_v2_s_spec":"|",
+    "densenet121_spec":    "_",
 }
 
 

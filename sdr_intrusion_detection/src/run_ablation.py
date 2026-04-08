@@ -27,6 +27,23 @@ from src.benchmark_edge import benchmark_all_models
 from src.evaluate import generate_all_figures
 
 
+def merge_benchmark_into_ablation(results_dir: str, benchmark_results: dict) -> None:
+    """Attach inference, size, and parameter metrics into ablation_results.json."""
+    ablation_path = os.path.join(results_dir, "ablation_results.json")
+    if not os.path.exists(ablation_path):
+        return
+
+    with open(ablation_path, 'r') as f:
+        ablation = json.load(f)
+
+    for model_name, metrics in benchmark_results.items():
+        if model_name in ablation and isinstance(ablation[model_name], dict):
+            ablation[model_name]['benchmark'] = metrics
+
+    with open(ablation_path, 'w') as f:
+        json.dump(ablation, f, indent=2, default=str)
+
+
 def run_hyperparameter_tuning(
     data_dir: str,
     results_dir: str,
@@ -49,7 +66,11 @@ def run_hyperparameter_tuning(
         lr = trial.suggest_float('lr', 1e-5, 1e-2, log=True)
         weight_decay = trial.suggest_float('weight_decay', 1e-6, 1e-2, log=True)
         batch_size = trial.suggest_categorical('batch_size', [64, 128, 256])
-        label_smoothing = trial.suggest_float('label_smoothing', 0.0, 0.2)
+        label_smoothing = trial.suggest_float('label_smoothing', 0.0, 0.15)
+        branch_dim = trial.suggest_categorical('branch_dim', [48, 64, 80])
+        spec_branch_dim = trial.suggest_categorical('spec_branch_dim', [64, 80, 96])
+        fusion_dim = trial.suggest_categorical('fusion_dim', [48, 64, 80])
+        dropout = trial.suggest_float('dropout', 0.05, 0.25)
         
         cfg = {
             'epochs': epochs,
@@ -59,6 +80,12 @@ def run_hyperparameter_tuning(
             'label_smoothing': label_smoothing,
             'patience': max(3, epochs // 3),
             'n_folds': 2,  # Quick 2-fold for speed
+            'model_kwargs': {
+                'branch_dim': branch_dim,
+                'spec_branch_dim': spec_branch_dim,
+                'fusion_dim': fusion_dim,
+                'dropout': dropout,
+            },
             # Use minimal logging
         }
         
@@ -79,7 +106,16 @@ def run_hyperparameter_tuning(
     for key, value in study.best_params.items():
         print(f"    {key}: {value}")
         
-    return study.best_params
+    best_params = dict(study.best_params)
+    model_kwargs = {
+        key: best_params.pop(key)
+        for key in ['branch_dim', 'spec_branch_dim', 'fusion_dim', 'dropout']
+        if key in best_params
+    }
+    if model_kwargs:
+        best_params['model_kwargs'] = model_kwargs
+
+    return best_params
 
 
 def run_full_pipeline(
@@ -97,11 +133,13 @@ def run_full_pipeline(
     tune: bool = False,
     n_trials: int = 20,
     n_folds: int = 5,
+    extended_baselines: bool = False,
 ):
     """
     Run the complete pipeline: generate → tune → train → benchmark → evaluate.
     """
     start_time = time.time()
+    all_results = None
 
     if quick:
         duration = min(duration, 2.0)
@@ -150,8 +188,15 @@ def run_full_pipeline(
         config = {
             'epochs': epochs,
             'batch_size': batch_size,
+            'label_smoothing': 0.05,
             'patience': max(5, epochs // 5),
             'n_folds': n_folds,
+            'model_kwargs': {
+                'branch_dim': 64,
+                'spec_branch_dim': 80,
+                'fusion_dim': 64,
+                'dropout': 0.15,
+            },
         }
         
         # Inject Optuna parameters if we tuned them!
@@ -163,7 +208,12 @@ def run_full_pipeline(
             if 'n_folds' in config:
                 del config['n_folds']
 
-        all_results = train_all_models(data_dir, results_dir, config)
+        all_results = train_all_models(
+            data_dir,
+            results_dir,
+            config,
+            include_extended_baselines=extended_baselines,
+        )
     else:
         print("\n  ⏩ Skipping training (--skip_train)")
 
@@ -175,7 +225,13 @@ def run_full_pipeline(
         print("  PHASE 3: Edge Inference Benchmarking")
         print("=" * 60)
 
-        benchmark_results = benchmark_all_models(results_dir)
+        benchmark_model_names = list(all_results.keys()) if all_results else None
+        benchmark_results = benchmark_all_models(
+            results_dir,
+            model_names=benchmark_model_names,
+            data_dir=data_dir,
+        )
+        merge_benchmark_into_ablation(results_dir, benchmark_results)
     else:
         print("\n  ⏩ Skipping benchmark (--skip_benchmark)")
 
@@ -225,6 +281,8 @@ def main():
                         help="Run Optuna hyperparameter optimization prior to training")
     parser.add_argument("--n_trials", type=int, default=20,
                         help="Number of Optuna trials for hyperparameter tuning")
+    parser.add_argument("--extended_baselines", action="store_true",
+                        help="Include 10 additional torchvision spectrogram baselines")
     args = parser.parse_args()
 
     run_full_pipeline(**vars(args))
