@@ -211,7 +211,14 @@ def train_model(
     set_seed(cfg['seed'])
     device = get_device(cfg['device'])
     os.makedirs(output_dir, exist_ok=True)
-    model_kwargs = cfg.get('model_kwargs', {})
+    raw_model_kwargs = cfg.get('model_kwargs', {})
+    if isinstance(raw_model_kwargs, dict) and model_name in raw_model_kwargs:
+        model_kwargs = raw_model_kwargs[model_name]
+    elif model_name == 'dual_branch_fusion' and isinstance(raw_model_kwargs, dict):
+        # Backward-compatible path for older configs that store only fusion kwargs.
+        model_kwargs = raw_model_kwargs
+    else:
+        model_kwargs = {}
 
     print(f"\n{'='*60}")
     print(f"  Training: {model_name}")

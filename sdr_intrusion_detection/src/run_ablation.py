@@ -113,7 +113,9 @@ def run_hyperparameter_tuning(
         if key in best_params
     }
     if model_kwargs:
-        best_params['model_kwargs'] = model_kwargs
+        best_params['model_kwargs'] = {
+            'dual_branch_fusion': model_kwargs,
+        }
 
     return best_params
 
@@ -196,10 +198,12 @@ def run_full_pipeline(
             'patience': max(5, epochs // 5),
             'n_folds': n_folds,
             'model_kwargs': {
-                'branch_dim': 64,
-                'spec_branch_dim': 80,
-                'fusion_dim': 64,
-                'dropout': 0.15,
+                'dual_branch_fusion': {
+                    'branch_dim': 64,
+                    'spec_branch_dim': 80,
+                    'fusion_dim': 64,
+                    'dropout': 0.15,
+                },
             },
         }
         
