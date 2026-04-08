@@ -23,7 +23,12 @@ from typing import Optional, Dict, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchvision import models as tv_models
+try:
+    from torchvision import models as tv_models
+    TORCHVISION_IMPORT_ERROR = None
+except Exception as e:
+    tv_models = None
+    TORCHVISION_IMPORT_ERROR = e
 
 from src.data_loader import (
     STFT_HOP,
@@ -530,6 +535,11 @@ class SpectrogramBackboneClassifier(nn.Module):
         resize_to: Tuple[int, int] = (224, 224),
     ):
         super().__init__()
+        if tv_models is None:
+            raise RuntimeError(
+                "Torchvision backbones are unavailable in this environment. "
+                f"Original import error: {TORCHVISION_IMPORT_ERROR}"
+            )
         self.backbone_name = backbone_name
         self.resize_to = resize_to
         self.input_adapter = nn.Sequential(
@@ -917,14 +927,18 @@ def print_model_summary():
     print(f"  {'-'*25} {'-'*12} {'-'*20}")
 
     for name, cls in MODEL_REGISTRY.items():
-        model = cls()
-        n_params = model.count_params()
         input_mode = get_model_input_mode(name)
         input_type = {
             "dual": "IQ + Spec",
             "spectrogram": "Spec only",
             "iq": "IQ only",
         }[input_mode]
+        try:
+            model = cls()
+        except Exception as e:
+            print(f"  {name:<25} {'UNAVAILABLE':>12} {input_type:>20}")
+            continue
+        n_params = model.count_params()
         print(f"  {name:<25} {n_params:>12,} {input_type:>20}")
 
     print(f"{'='*60}\n")
