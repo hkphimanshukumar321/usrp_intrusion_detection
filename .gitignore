@@ -1,0 +1,12 @@
+# ============================================================
+# SDR Intrusion Detection - Repository Root .gitignore
+# ============================================================
+
+# --- Large Datasets & Archives ---
+raw_datasets/
+archive_v1/
+
+# --- Python Environment & Caching ---
+.venv/
+.pytest_cache/
+.dist/
