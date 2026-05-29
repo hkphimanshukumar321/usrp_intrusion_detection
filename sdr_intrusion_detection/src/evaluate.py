@@ -62,7 +62,7 @@ def evaluate_model(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--data_dir', type=str, default=r'C:\Users\hkphi\OneDrive\Desktop\WORK\EndSemDSLabK\unified_dataset')
+    parser.add_argument('--data_dir', type=str, default=os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'unified_dataset')))
     parser.add_argument('--model', type=str, default='SDR_Custom_CoordASPP_Focal')
     parser.add_argument('--batch_size', type=int, default=32)
     args = parser.parse_args()

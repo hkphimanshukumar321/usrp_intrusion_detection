@@ -16,7 +16,7 @@ from src.evaluate import evaluate_model
 from src.model import TIMM_MODEL_MAP
 
 CUSTOM_MODEL = 'SDR_Custom_CoordASPP_Focal'
-DEFAULT_DATA = r'C:\Users\hkphi\OneDrive\Desktop\WORK\EndSemDSLabK\unified_dataset'
+DEFAULT_DATA = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'unified_dataset'))
 
 
 # ============================================================
