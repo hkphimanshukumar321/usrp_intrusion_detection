@@ -62,7 +62,7 @@ echo "=============================================="
 # -----------------------------------------------------------
 echo ""
 echo ">>> PHASE 1: Backbone Comparison (${MAX_WORKERS} parallel workers)"
-python -m src.run_ablation --phase backbone --epochs 30 --batch_size 64 --max_workers ${MAX_WORKERS}
+python -m src.run_ablation --phase backbone --epochs 50 --batch_size 64 --max_workers ${MAX_WORKERS}
 
 # -----------------------------------------------------------
 # PHASE 2: Hyperparameter Sweep (Optuna, 20 trials)
@@ -71,7 +71,7 @@ python -m src.run_ablation --phase backbone --epochs 30 --batch_size 64 --max_wo
 # -----------------------------------------------------------
 echo ""
 echo ">>> PHASE 2: Hyperparameter Sweep"
-python -m src.run_ablation --phase hparam --epochs 20 --n_trials 20
+python -m src.run_ablation --phase hparam --epochs 30 --n_trials 20
 
 # -----------------------------------------------------------
 # PHASE 3: Cross-Dataset Generalization

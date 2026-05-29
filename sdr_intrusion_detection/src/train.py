@@ -112,6 +112,11 @@ def train_model(args):
     best_val_acc = 0.0
     history = []
 
+    # Early stopping
+    patience = getattr(args, 'patience', 7)
+    epochs_no_improve = 0
+    early_stopped = False
+
     for epoch in range(args.epochs):
         model.train()
         running_loss = 0.0
@@ -175,6 +180,7 @@ def train_model(args):
 
         if val_acc > best_val_acc:
             best_val_acc = val_acc
+            epochs_no_improve = 0
             pth_path = f'checkpoints/best_{args.model}.pth'
             torch.save(model.state_dict(), pth_path)
 
@@ -193,15 +199,25 @@ def train_model(args):
             except Exception:
                 pass  # Some timm models don't export cleanly
             print(f"  [*] Best Model Saved (.pth + .onnx). Acc: {best_val_acc:.2f}%")
+        else:
+            epochs_no_improve += 1
+            if epochs_no_improve >= patience:
+                print(f"  [!] Early stopping triggered at epoch {epoch+1} (no improvement for {patience} epochs)")
+                early_stopped = True
+                break
 
     # Save local JSON log
+    actual_epochs = len(history)
     log_data = {
         "model": args.model,
         "profile": profile_metrics,
         "best_val_acc": best_val_acc,
+        "early_stopped": early_stopped,
+        "actual_epochs": actual_epochs,
         "config": {
             "lr": args.lr, "batch_size": args.batch_size,
             "epochs": args.epochs,
+            "patience": patience,
             "focal_gamma": gamma,
             "optimizer": getattr(args, 'optimizer', 'adamw'),
             "weight_decay": weight_decay
@@ -211,8 +227,10 @@ def train_model(args):
     with open(f'results/logs/history_{args.model}.json', 'w') as f:
         json.dump(log_data, f, indent=4)
 
+    wandb.log({"early_stopped": early_stopped, "actual_epochs": actual_epochs})
     wandb.finish()
-    print(f"\nTraining Complete. Best Val Acc: {best_val_acc:.2f}%")
+    stop_msg = f" (early stopped at epoch {actual_epochs})" if early_stopped else ""
+    print(f"\nTraining Complete. Best Val Acc: {best_val_acc:.2f}%{stop_msg}")
     return log_data
 
 
@@ -220,11 +238,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--data_dir', type=str, default=os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'unified_dataset')))
     parser.add_argument('--model', type=str, default='SDR_Custom_CoordASPP_Focal')
-    parser.add_argument('--epochs', type=int, default=20)
+    parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--focal_gamma', type=float, default=2.0)
     parser.add_argument('--optimizer', type=str, default='adamw', choices=['adamw', 'sgd'])
     parser.add_argument('--weight_decay', type=float, default=1e-4)
+    parser.add_argument('--patience', type=int, default=7, help='Early stopping patience (epochs without improvement)')
     args = parser.parse_args()
     train_model(args)

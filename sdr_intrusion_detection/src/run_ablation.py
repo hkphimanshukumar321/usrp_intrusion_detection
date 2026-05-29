@@ -273,7 +273,7 @@ def phase_cross_dataset(epochs, batch_size):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="IEEE Ablation Study — 3 Phases (Parallel)")
     parser.add_argument("--data_dir", type=str, default=DEFAULT_DATA)
-    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--phase", type=str, default="all",
                         choices=["all", "backbone", "hparam", "cross"],
