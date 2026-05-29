@@ -36,10 +36,11 @@ _PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 def _train_single_model_subprocess(model_name, data_dir, epochs, batch_size, lr):
     """
     Train ONE model in a fresh subprocess.
+    Streams output line-by-line to both a log file AND stdout (prefixed with model name).
     Returns (model_name, result_dict) or (model_name, error_string).
     """
     cmd = [
-        sys.executable, '-m', 'src.train',
+        sys.executable, '-u', '-m', 'src.train',   # -u = unbuffered Python output
         '--data_dir', data_dir,
         '--model', model_name,
         '--epochs', str(epochs),
@@ -51,13 +52,26 @@ def _train_single_model_subprocess(model_name, data_dir, epochs, batch_size, lr)
 
     try:
         with open(log_path, 'w') as logf:
-            proc = subprocess.run(
+            proc = subprocess.Popen(
                 cmd,
                 cwd=_PROJECT_ROOT,
-                stdout=logf,
+                stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                timeout=7200  # 2h safety
+                text=True,
+                bufsize=1  # Line-buffered
             )
+            # Stream output line-by-line: write to log + print with prefix
+            for line in proc.stdout:
+                line = line.rstrip('\n')
+                logf.write(line + '\n')
+                logf.flush()
+                # Print key lines to parent stdout with model tag
+                if any(kw in line for kw in ['Epoch', 'Val Acc', 'Best Model', 'PROFILING',
+                                              'Train Loss', 'Val Loss', 'Dataset Class',
+                                              'Loaded Dataset', 'device:', 'Parameters']):
+                    print(f"  [{model_name}] {line}", flush=True)
+            proc.wait(timeout=7200)
+
         # After training, read the JSON history produced by train.py
         history_path = os.path.join(_PROJECT_ROOT, 'results', 'logs', f'history_{model_name}.json')
         if os.path.isfile(history_path):
@@ -67,6 +81,7 @@ def _train_single_model_subprocess(model_name, data_dir, epochs, batch_size, lr)
         else:
             return (model_name, f"Process exited with code {proc.returncode} but no history JSON found. Check {log_path}")
     except subprocess.TimeoutExpired:
+        proc.kill()
         return (model_name, f"TIMEOUT after 2 hours. Check {log_path}")
     except Exception as e:
         return (model_name, str(e))
@@ -75,15 +90,18 @@ def _train_single_model_subprocess(model_name, data_dir, epochs, batch_size, lr)
 def phase_backbone(data_dir, epochs, batch_size, max_workers=2):
     """Train all 19 architectures using parallel subprocesses."""
     models = [CUSTOM_MODEL] + list(TIMM_MODEL_MAP.keys())
+    total = len(models)
 
-    print("=" * 80)
-    print(f"  PHASE 1: BACKBONE COMPARISON ({len(models)} architectures)")
-    print(f"  Parallelism: max_workers = {max_workers}")
-    print("=" * 80)
+    print("=" * 80, flush=True)
+    print(f"  PHASE 1: BACKBONE COMPARISON ({total} architectures)", flush=True)
+    print(f"  Parallelism: max_workers = {max_workers}", flush=True)
+    print("=" * 80, flush=True)
 
     summary = {}
     failed = []
+    completed = 0
     lr = 1e-3
+    t_start = time.time()
 
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
         futures = {
@@ -94,8 +112,12 @@ def phase_backbone(data_dir, epochs, batch_size, max_workers=2):
             for name in models
         }
 
+        print(f"\n  ⏳ Submitted {total} models. Waiting for results...\n", flush=True)
+
         for future in as_completed(futures):
             model_name = futures[future]
+            completed += 1
+            elapsed = time.time() - t_start
             try:
                 name, result = future.result()
                 if isinstance(result, dict):
@@ -103,13 +125,13 @@ def phase_backbone(data_dir, epochs, batch_size, max_workers=2):
                         "best_val_acc": result.get("best_val_acc", 0),
                         "profile": result.get("profile", {})
                     }
-                    print(f"  ✓ [{name}] Done — Val Acc: {result.get('best_val_acc', 0):.2f}%")
+                    print(f"\n  ✓ [{completed}/{total}] {name} — Val Acc: {result.get('best_val_acc', 0):.2f}%  (elapsed: {elapsed/60:.1f} min)", flush=True)
                 else:
                     failed.append(name)
-                    print(f"  ✗ [{name}] FAILED: {result}")
+                    print(f"\n  ✗ [{completed}/{total}] {name} FAILED: {result}  (elapsed: {elapsed/60:.1f} min)", flush=True)
             except Exception as exc:
                 failed.append(model_name)
-                print(f"  ✗ [{model_name}] Exception: {exc}")
+                print(f"\n  ✗ [{completed}/{total}] {model_name} Exception: {exc}  (elapsed: {elapsed/60:.1f} min)", flush=True)
 
     os.makedirs(os.path.join(_PROJECT_ROOT, 'results'), exist_ok=True)
     out_path = os.path.join(_PROJECT_ROOT, 'results', 'ablation_backbone.json')
