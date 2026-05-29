@@ -68,3 +68,7 @@ results/*
 !results/.gitkeep
 
 EndSemDSLabK\EndSemDSLabK\K.dat
+
+# --- Parent / External Directories ---
+../raw_datasets/
+../archive_v1/

@@ -1,110 +1,156 @@
-import torch
+"""
+test_model.py — Smoke, Functional, and Integration Tests for model.py
+=====================================================================
+"""
 import pytest
+import torch
 from src.model import (
-    CBAM1D,
-    ComplexEncoder,
-    CrossModalAttention,
-    DualBranchFusionCNN,
-    NUM_CLASSES,
-    WINDOW_SIZE,
-    build_model,
-    get_model_input_mode,
+    get_model, SDR_Custom_CoordASPP_Focal,
+    CoordinateAttention, LightASPP,
+    TIMM_MODEL_MAP
 )
-
-def test_complex_encoder(dummy_iq_batch):
-    """Verify the Math: [B, W, 2] -> [B, 4, W] with correct magnitudes and phases"""
-    encoder = ComplexEncoder()
-    out = encoder(dummy_iq_batch)
-    
-    B, W, _ = dummy_iq_batch.shape
-    assert out.shape == (B, 4, W), "ComplexEncoder output shape mismatch"
-    
-    # Assert amplitude is mathematically correct: sqrt(I^2 + Q^2)
-    # the encoder outputs [I, Q, amp, phase]
-    # out[:, 0:1] is I, out[:, 1:2] is Q, out[:, 2:3] is amp
-    I = out[:, 0, :]
-    Q = out[:, 1, :]
-    amp = out[:, 2, :]
-    
-    expected_amp = torch.sqrt(I**2 + Q**2)
-    torch.testing.assert_close(amp, expected_amp, rtol=1e-5, atol=1e-5)
-
-def test_cbam1d():
-    """Verify CBAM channel and spatial attention logic preserves shapes."""
-    batch_size = 4
-    channels = 32
-    length = 128
-    dummy_input = torch.randn(batch_size, channels, length)
-    
-    cbam = CBAM1D(channels=channels, reduction=8)
-    out = cbam(dummy_input)
-    assert out.shape == dummy_input.shape, "CBAM1D altered the input tensor shape"
-
-def test_cross_modal_attention():
-    """Verify cross modality attention logic preserves dimension sizes."""
-    batch_size = 2
-    dim = 64
-    seq_len = 16
-    freq_time_flat = 36  # F * T equivalent
-    
-    # dummy feature maps representing outputs of CNNs before pooling
-    iq_maps = torch.randn(batch_size, dim, seq_len)
-    spec_maps = torch.randn(batch_size, dim, 6, 6) # [B, dim, F', T'] where 6*6=36
-    
-    cross_attn = CrossModalAttention(dim=dim, num_heads=2)
-    out_iq, out_spec = cross_attn(iq_maps, spec_maps)
-    
-    assert out_iq.shape == iq_maps.shape, "CrossModalAttention messed up IQ branch shape"
-    assert out_spec.shape == spec_maps.shape, "CrossModalAttention messed up Spectrogram branch shape"
-
-def test_dual_branch_fusion_forward(dummy_iq_batch, dummy_spec_batch):
-    """Smoke Test: Verify end-to-end forward pass of the SOTA model natively."""
-    model = DualBranchFusionCNN(
-        window_size=WINDOW_SIZE, 
-        num_classes=NUM_CLASSES, 
-        branch_dim=64, # smaller dim for faster testing
-        fusion_dim=64
-    )
-    
-    # Just to confirm the inputs match what the Data Loader yields
-    assert dummy_iq_batch.shape[1] == WINDOW_SIZE
-    assert dummy_iq_batch.shape[2] == 2
-    
-    logits = model(dummy_iq_batch, dummy_spec_batch)
-    
-    B = dummy_iq_batch.shape[0]
-    assert logits.shape == (B, NUM_CLASSES), "Output logits must be shape [B, num_classes]"
-
-def test_dual_branch_fusion_get_features(dummy_iq_batch, dummy_spec_batch):
-    """Smoke Test: Verify feature extraction works for t-SNE evaluation."""
-    model = DualBranchFusionCNN(branch_dim=64, fusion_dim=64)
-    features = model.get_features(dummy_iq_batch, dummy_spec_batch)
-    
-    B = dummy_iq_batch.shape[0]
-    assert features.shape == (B, 64), "get_features must return exactly the fusion_dim size [B, 64] before the final layer"
+from src.data_loader import NUM_CLASSES
 
 
-def test_dual_branch_fusion_is_compact():
-    """The SOTA fusion model should stay below the old heavy baseline size."""
-    fusion_params = build_model("dual_branch_fusion").count_params()
-    cnn1d_params = build_model("cnn1d_iq").count_params()
+# ============================================================
+# SMOKE TESTS — Does it even load without crashing?
+# ============================================================
+class TestSmoke:
+    def test_custom_model_instantiates(self):
+        """Can our custom model be created without errors?"""
+        model = get_model('SDR_Custom_CoordASPP_Focal')
+        assert model is not None
 
-    assert fusion_params < cnn1d_params
+    def test_factory_rejects_unknown_name(self):
+        """Does get_model reject garbage names?"""
+        with pytest.raises(ValueError, match="Unknown model"):
+            get_model("TotallyFakeModel_999")
+
+    def test_timm_baseline_instantiates(self):
+        """Can we load at least one timm baseline?"""
+        model = get_model('DenseNet121')
+        assert model is not None
+
+    def test_timm_model_map_not_empty(self):
+        """Is the TIMM_MODEL_MAP populated?"""
+        assert len(TIMM_MODEL_MAP) >= 18
 
 
-@pytest.mark.parametrize(
-    "model_name",
-    ["mobilenet_v2_spec", "resnet18_spec", "densenet121_spec", "efficientnet_v2_s_spec"],
-)
-def test_extended_spectrogram_backbones_forward(model_name, dummy_spec_batch):
-    """Extended spectrogram baselines should accept [B, 1, F, T] tensors."""
-    model = build_model(model_name)
-    assert get_model_input_mode(model_name) == "spectrogram"
-    spec_batch = dummy_spec_batch[:1]
+# ============================================================
+# FUNCTIONAL TESTS — Does the math work correctly?
+# ============================================================
+class TestFunctional:
+    def test_custom_forward_pass_shape(self):
+        """Does the custom model produce [B, 6] output from [B, 3, 224, 224]?"""
+        model = SDR_Custom_CoordASPP_Focal(num_classes=NUM_CLASSES, pretrained=False)
+        model.eval()
+        x = torch.randn(2, 3, 224, 224)
+        with torch.no_grad():
+            out = model(x)
+        assert out.shape == (2, NUM_CLASSES), f"Expected (2, {NUM_CLASSES}), got {out.shape}"
 
-    with torch.no_grad():
-        logits = model(spec_batch)
-        features = model.get_features(spec_batch)
+    def test_coordinate_attention_preserves_shape(self):
+        """Does CoordinateAttention output the same shape as input?"""
+        ca = CoordinateAttention(64, 64)
+        x = torch.randn(2, 64, 14, 14)
+        with torch.no_grad():
+            out = ca(x)
+        assert out.shape == x.shape
 
-    assert logits.shape == (spec_batch.shape[0], NUM_CLASSES)
-    assert features.ndim == 2
+    def test_light_aspp_preserves_shape(self):
+        """Does LightASPP maintain spatial dims?"""
+        aspp = LightASPP(128, 128)
+        x = torch.randn(2, 128, 7, 7)
+        with torch.no_grad():
+            out = aspp(x)
+        assert out.shape == x.shape
+
+    def test_custom_model_feature_dim(self):
+        """Is the feature_dim correctly set to 1536 (512*3)?"""
+        model = SDR_Custom_CoordASPP_Focal(pretrained=False)
+        assert model.feature_dim == 1536
+
+    def test_custom_model_has_attention(self):
+        """Does the model have CoordinateAttention modules?"""
+        model = SDR_Custom_CoordASPP_Focal(pretrained=False)
+        assert hasattr(model, 'attention')
+        assert hasattr(model, 'ca_s2')
+        assert hasattr(model, 'ca_s3')
+
+    def test_custom_model_count_params(self):
+        """Does count_params return a positive integer?"""
+        model = SDR_Custom_CoordASPP_Focal(pretrained=False)
+        n = model.count_params()
+        assert isinstance(n, int)
+        assert n > 0
+
+    def test_baseline_forward_pass_shape(self):
+        """Does a timm baseline produce [B, 6] output?"""
+        model = get_model('DenseNet121')
+        model.eval()
+        x = torch.randn(2, 3, 224, 224)
+        with torch.no_grad():
+            out = model(x)
+        assert out.shape == (2, NUM_CLASSES)
+
+    def test_output_not_all_zeros(self):
+        """Verify logits are non-trivial (not all zeros)."""
+        model = SDR_Custom_CoordASPP_Focal(pretrained=False)
+        model.eval()
+        x = torch.randn(1, 3, 224, 224)
+        with torch.no_grad():
+            out = model(x)
+        assert not torch.allclose(out, torch.zeros_like(out))
+
+
+# ============================================================
+# INTEGRATION TESTS — Does it work with the data pipeline?
+# ============================================================
+class TestIntegration:
+    def test_model_with_simulated_batch(self):
+        """Simulate a full training step: forward -> loss -> backward."""
+        model = SDR_Custom_CoordASPP_Focal(num_classes=NUM_CLASSES, pretrained=False)
+        model.train()
+
+        x = torch.randn(4, 3, 224, 224)
+        y = torch.randint(0, NUM_CLASSES, (4,))
+
+        out = model(x)
+        loss = torch.nn.CrossEntropyLoss()(out, y)
+        loss.backward()
+
+        # Verify gradients exist
+        has_grad = any(p.grad is not None for p in model.parameters() if p.requires_grad)
+        assert has_grad, "No gradients after backward pass!"
+
+    def test_model_checkpoint_save_load(self, tmp_path):
+        """Can we save and reload the model without data corruption?"""
+        model = SDR_Custom_CoordASPP_Focal(num_classes=NUM_CLASSES, pretrained=False)
+        model.eval()
+
+        x = torch.randn(1, 3, 224, 224)
+        with torch.no_grad():
+            original_out = model(x)
+
+        # Save
+        path = tmp_path / "test_model.pth"
+        torch.save(model.state_dict(), path)
+
+        # Reload into fresh model
+        model2 = SDR_Custom_CoordASPP_Focal(num_classes=NUM_CLASSES, pretrained=False)
+        model2.load_state_dict(torch.load(path, weights_only=True))
+        model2.eval()
+
+        with torch.no_grad():
+            loaded_out = model2(x)
+
+        assert torch.allclose(original_out, loaded_out, atol=1e-5), \
+            "Output changed after save/load!"
+
+    def test_all_timm_names_are_valid(self):
+        """Verify every key in TIMM_MODEL_MAP creates a real model."""
+        # Only test a subset to keep tests fast
+        fast_models = ['DenseNet121', 'MobileNetV2', 'VGG16']
+        for name in fast_models:
+            model = get_model(name)
+            assert model is not None, f"Failed to create {name}"

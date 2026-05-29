@@ -1,13 +1,70 @@
 #!/bin/bash
+# ============================================================
+# run_training.sh — A100-Optimized Full Ablation Pipeline
+# ============================================================
+# Designed for Tesla A100 (32GB shared GPU memory).
+# Runs all 3 ablation phases sequentially, then generates figures.
+#
+# Usage:
+#   chmod +x run_training.sh
+#   nohup ./run_training.sh > training_full.log 2>&1 &
+# ============================================================
 
-# Start the training pipeline in the background using nohup
-# Assumes you are in the sdr_intrusion_detection directory
+set -e
+export CUDA_VISIBLE_DEVICES=0
+export PYTHONUNBUFFERED=1
+export HF_HUB_DISABLE_SYMLINKS_WARNING=1
 
-echo "Starting ablation study training in the background..."
+echo "=============================================="
+echo "  SDR Intrusion Detection — Full Pipeline"
+echo "  GPU: Tesla A100 (32GB)"
+echo "  Started: $(date)"
+echo "=============================================="
 
-nohup python -m src.train --train_all > training.log 2>&1 &
+# -----------------------------------------------------------
+# PHASE 1: Backbone Comparison (19 models, sequential)
+# Each model loads into the A100 one at a time.
+# The largest model (EfficientNetV2L ~450MB) fits easily.
+# -----------------------------------------------------------
+echo ""
+echo ">>> PHASE 1: Backbone Comparison"
+python -m src.run_ablation --phase backbone --epochs 30 --batch_size 64
 
-echo "Training started! PID: $!"
-echo "Logs are being written to training.log"
-echo "To view the progress in real-time, run:"
-echo "tail -f training.log"
+# -----------------------------------------------------------
+# PHASE 2: Hyperparameter Sweep (Optuna, 20 trials)
+# Only trains our custom model with different HP configs.
+# -----------------------------------------------------------
+echo ""
+echo ">>> PHASE 2: Hyperparameter Sweep"
+python -m src.run_ablation --phase hparam --epochs 20 --n_trials 20
+
+# -----------------------------------------------------------
+# PHASE 3: Cross-Dataset Generalization
+# Train on USRP -> Test on Radar (and vice versa)
+# -----------------------------------------------------------
+echo ""
+echo ">>> PHASE 3: Cross-Dataset Generalization"
+python -m src.run_ablation --phase cross --epochs 20
+
+# -----------------------------------------------------------
+# EDGE BENCHMARKING
+# -----------------------------------------------------------
+echo ""
+echo ">>> Edge Inference Benchmarking"
+python -m src.benchmark_edge --n_runs 200
+
+# -----------------------------------------------------------
+# FIGURE GENERATION
+# -----------------------------------------------------------
+echo ""
+echo ">>> Generating IEEE Figures"
+python -m src.generate_figures
+
+echo ""
+echo "=============================================="
+echo "  ALL DONE!"
+echo "  Finished: $(date)"
+echo "  Results:  results/"
+echo "  Figures:  results/figures/"
+echo "  W&B:      https://wandb.ai"
+echo "=============================================="

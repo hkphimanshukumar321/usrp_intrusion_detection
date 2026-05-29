@@ -1,702 +1,230 @@
-#!/usr/bin/env python3
-"""
-train.py — Training pipeline for all intrusion detection models.
-
-Supports:
-  - Single-input models (MLP, CNN1D, CNN2D) and dual-input models (Fusion)
-  - 5-fold stratified cross-validation
-  - SNR-sweep evaluation
-  - Early stopping
-  - Model checkpointing
-  - SVM and Spike-based baseline training
-
-Usage:
-    python -m src.train --model dual_branch_fusion --data_dir dataset/simulated
-    python -m src.train --model cnn1d_iq --epochs 50 --batch_size 256
-    python -m src.train --train_all   # train all models for ablation comparison
-"""
-
-import argparse
-import json
 import os
-import pickle
+import json
+import argparse
 import time
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, Subset
-from sklearn.model_selection import StratifiedKFold
-from sklearn.svm import SVC
-from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import accuracy_score, classification_report
-from collections import defaultdict
-from typing import Dict, List, Tuple, Optional
-
-from src.data_loader import (
-    IQDataset,
-    IQAugmentation,
-    CLASS_NAMES,
-    WINDOW_SIZE,
-    build_scenario_level_folds,
-)
-from src.feature_extraction import (
-    compute_spectrogram_batch,
-    compute_statistical_features_batch,
-    MultiRepresentationDataset,
-)
-from src.spike_detector import SpikeBasedClassifier
-from src.model import (
-    build_model, is_dual_input, MODEL_REGISTRY,
-    DUAL_INPUT_MODELS, EXTENDED_SPECTROGRAM_MODELS,
-    get_model_input_mode, print_model_summary,
-)
+import wandb
+from tqdm import tqdm
+from src.data_loader import get_dataloaders, CLASS_NAMES
+from src.model import get_model
 
 
-# ============================================================
-# Training Configuration
-# ============================================================
-DEFAULT_CONFIG = {
-    'epochs': 50,
-    'batch_size': 128,
-    'lr': 1e-3,
-    'weight_decay': 1e-4,
-    'label_smoothing': 0.1,
-    'patience': 10,
-    'n_folds': 5,
-    'num_workers': min(4, os.cpu_count() or 1),
-    'device': 'auto',
-    'seed': 42,
-}
+class FocalLoss(nn.Module):
+    """Focal Loss with configurable gamma for hard-example mining."""
+    def __init__(self, alpha=1, gamma=2, reduction='mean'):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+        self.ce = nn.CrossEntropyLoss(reduction='none')
+
+    def forward(self, inputs, targets):
+        ce_loss = self.ce(inputs, targets)
+        pt = torch.exp(-ce_loss)
+        focal_loss = self.alpha * (1 - pt) ** self.gamma * ce_loss
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        return focal_loss
 
 
-def get_device(preference: str = 'auto') -> torch.device:
-    if preference == 'auto':
-        return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    return torch.device(preference)
+def profile_model(model, device):
+    """Calculates Params, Size, and Inference Latency."""
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    model_size_mb = (total_params * 4) / (1024 ** 2)
 
-
-def set_seed(seed: int):
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-
-def prepare_model_inputs(
-    batch,
-    device: torch.device,
-    input_mode: str,
-) -> Tuple[Tuple[torch.Tensor, ...], torch.Tensor]:
-    """Route a batch to the right input signature for the selected model."""
-    if isinstance(batch, dict):
-        labels = batch['label'].to(device)
-
-        if input_mode == 'dual':
-            return (
-                batch['iq'].to(device),
-                batch['spectrogram'].to(device),
-            ), labels
-
-        if input_mode == 'spectrogram':
-            return (batch['spectrogram'].to(device),), labels
-
-        return (batch['iq'].to(device),), labels
-
-    inputs, labels = batch
-    return (inputs.to(device),), labels.to(device)
-
-
-# ============================================================
-# Single Epoch Training
-# ============================================================
-def train_one_epoch(
-    model: nn.Module,
-    loader: DataLoader,
-    criterion: nn.Module,
-    optimizer: optim.Optimizer,
-    device: torch.device,
-    input_mode: str = 'iq',
-) -> Tuple[float, float]:
-    """Train for one epoch, return (loss, accuracy)."""
-    model.train()
-    total_loss = 0.0
-    correct = 0
-    total = 0
-
-    for batch in loader:
-        inputs, labels = prepare_model_inputs(batch, device, input_mode)
-        logits = model(*inputs)
-
-        loss = criterion(logits, labels)
-
-        optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
-
-        total_loss += loss.item() * labels.size(0)
-        _, predicted = logits.max(1)
-        correct += predicted.eq(labels).sum().item()
-        total += labels.size(0)
-
-    avg_loss = total_loss / max(total, 1)
-    accuracy = correct / max(total, 1)
-    return avg_loss, accuracy
-
-
-# ============================================================
-# Validation
-# ============================================================
-@torch.no_grad()
-def validate(
-    model: nn.Module,
-    loader: DataLoader,
-    criterion: nn.Module,
-    device: torch.device,
-    input_mode: str = 'iq',
-) -> Tuple[float, float, np.ndarray, np.ndarray]:
-    """Validate model, return (loss, accuracy, all_preds, all_labels)."""
+    # Benchmark inference time
     model.eval()
-    total_loss = 0.0
-    correct = 0
-    total = 0
-    all_preds = []
-    all_labels = []
-
-    for batch in loader:
-        inputs, labels = prepare_model_inputs(batch, device, input_mode)
-        logits = model(*inputs)
-
-        loss = criterion(logits, labels)
-        total_loss += loss.item() * labels.size(0)
-        _, predicted = logits.max(1)
-        correct += predicted.eq(labels).sum().item()
-        total += labels.size(0)
-
-        all_preds.append(predicted.cpu().numpy())
-        all_labels.append(labels.cpu().numpy())
-
-    avg_loss = total_loss / max(total, 1)
-    accuracy = correct / max(total, 1)
-    all_preds = np.concatenate(all_preds)
-    all_labels = np.concatenate(all_labels)
-
-    return avg_loss, accuracy, all_preds, all_labels
-
-
-# ============================================================
-# Full Training Loop with K-Fold CV
-# ============================================================
-def train_model(
-    model_name: str,
-    data_dir: str,
-    output_dir: str = "results/models",
-    config: dict = None,
-    dataset: IQDataset = None,
-) -> Dict:
-    """
-    Train a model with k-fold cross-validation.
-
-    Args:
-        model_name: Name from MODEL_REGISTRY
-        data_dir: Path to dataset directory
-        output_dir: Where to save model checkpoints
-        config: Training configuration dict
-
-    Returns:
-        Dictionary of results (per-fold accuracies, best metrics, etc.)
-    """
-    cfg = {**DEFAULT_CONFIG, **(config or {})}
-    set_seed(cfg['seed'])
-    device = get_device(cfg['device'])
-    os.makedirs(output_dir, exist_ok=True)
-    raw_model_kwargs = cfg.get('model_kwargs', {})
-    if isinstance(raw_model_kwargs, dict) and model_name in raw_model_kwargs:
-        model_kwargs = raw_model_kwargs[model_name]
-    elif model_name == 'dual_branch_fusion' and isinstance(raw_model_kwargs, dict):
-        # Backward-compatible path for older configs that store only fusion kwargs.
-        model_kwargs = raw_model_kwargs
-    else:
-        model_kwargs = {}
-
-    print(f"\n{'='*60}")
-    print(f"  Training: {model_name}")
-    print(f"  Device: {device}")
+    dummy = torch.randn(1, 3, 224, 224).to(device)
+    # Warmup
+    with torch.no_grad():
+        for _ in range(5):
+            model(dummy)
     if device.type == 'cuda':
-        print(f"  GPU Specs: {torch.cuda.get_device_name(0)} "
-              f"({torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB VRAM)")
-    print(f"  Config: {json.dumps(cfg, indent=2)}")
-    print(f"{'='*60}\n")
+        torch.cuda.synchronize()
 
-    # --- Load dataset ---
-    input_mode = get_model_input_mode(model_name)
+    times = []
+    with torch.no_grad():
+        for _ in range(50):
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            model(dummy)
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
+            times.append((time.perf_counter() - t0) * 1000)
 
-    if dataset is not None:
-        iq_dataset = dataset
+    return {
+        "Total_Parameters": total_params,
+        "Trainable_Parameters": trainable_params,
+        "Model_Size_MB": round(model_size_mb, 2),
+        "Inference_Time_ms": round(sum(times) / len(times), 2)
+    }
+
+
+def train_model(args):
+    """Full training loop with W&B logging, profiling, and local JSON history."""
+
+    wandb.init(
+        project="SDR-Intrusion-Detection",
+        name=f"{args.model}_lr{args.lr}_bs{args.batch_size}",
+        config=vars(args),
+        reinit=True
+    )
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+
+    train_loader, val_loader, _ = get_dataloaders(
+        dataset_dir=args.data_dir,
+        batch_size=args.batch_size,
+        num_workers=4
+    )
+
+    model = get_model(model_name=args.model).to(device)
+
+    # Profile
+    print("\n--- MODEL PROFILING ---")
+    profile_metrics = profile_model(model, device)
+    for k, v in profile_metrics.items():
+        print(f"  {k}: {v}")
+    print("-----------------------\n")
+    wandb.log(profile_metrics)
+
+    # Optimization
+    gamma = getattr(args, 'focal_gamma', 2.0)
+    dropout = getattr(args, 'dropout', 0.3)
+    weight_decay = getattr(args, 'weight_decay', 1e-4)
+
+    criterion = FocalLoss(gamma=gamma)
+
+    if getattr(args, 'optimizer', 'adamw') == 'sgd':
+        optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=0.9, weight_decay=weight_decay)
     else:
-        # Load fresh if not provided
-        iq_dataset = IQDataset(data_dir, window_size=WINDOW_SIZE)
+        optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=weight_decay)
 
-    # IQDataset now returns dicts {'iq', 'spectrogram', 'label'}
-    # So we don't need MultiRepresentationDataset anymore.
-    dataset = iq_dataset
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
-    # --- K-Fold CV ---
-    labels = iq_dataset.labels
-    if iq_dataset.scenario_ids is not None:
-        split_indices = build_scenario_level_folds(
-            labels,
-            iq_dataset.scenario_ids,
-            n_splits=cfg['n_folds'],
-            seed=cfg['seed'],
-        )
-        print(f"  Using scenario-level CV with {len(np.unique(iq_dataset.scenario_ids))} scenarios")
-    else:
-        skf = StratifiedKFold(
-            n_splits=cfg['n_folds'], shuffle=True, random_state=cfg['seed']
-        )
-        split_indices = list(skf.split(np.zeros(len(labels)), labels))
-        print("  Using window-level stratified CV (no scenario metadata found)")
+    os.makedirs('checkpoints', exist_ok=True)
+    os.makedirs('results/logs', exist_ok=True)
+    best_val_acc = 0.0
+    history = []
 
-    fold_results = []
-    best_overall_acc = 0.0
+    for epoch in range(args.epochs):
+        model.train()
+        running_loss = 0.0
+        correct = 0
+        total = 0
 
-    for fold_idx, (train_idx, val_idx) in enumerate(split_indices):
-        print(f"\n--- Fold {fold_idx+1}/{cfg['n_folds']} ---")
+        train_pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs} [Train]")
+        for inputs, targets in train_pbar:
+            inputs, targets = inputs.to(device), targets.to(device)
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
+            loss.backward()
+            optimizer.step()
 
-        train_subset = Subset(dataset, train_idx)
-        val_subset = Subset(dataset, val_idx)
+            running_loss += loss.item()
+            _, predicted = outputs.max(1)
+            total += targets.size(0)
+            correct += predicted.eq(targets).sum().item()
+            train_pbar.set_postfix({'loss': f"{loss.item():.4f}"})
 
-        train_loader = DataLoader(
-            train_subset, batch_size=cfg['batch_size'], shuffle=True,
-            num_workers=cfg['num_workers'], pin_memory=True, drop_last=True,
-        )
-        val_loader = DataLoader(
-            val_subset, batch_size=cfg['batch_size'], shuffle=False,
-            num_workers=cfg['num_workers'], pin_memory=True,
-        )
+        train_acc = 100. * correct / total
+        train_loss = running_loss / len(train_loader)
 
-        # Build fresh model for each fold
-        model = build_model(model_name, **model_kwargs).to(device)
-        criterion = nn.CrossEntropyLoss(label_smoothing=cfg['label_smoothing'])
-        optimizer = optim.AdamW(
-            model.parameters(), lr=cfg['lr'], weight_decay=cfg['weight_decay']
-        )
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode='min', factor=0.5, patience=5, min_lr=1e-6
-        )
+        # Validation
+        model.eval()
+        val_loss = 0.0
+        val_correct = 0
+        val_total = 0
 
-        # Training loop with early stopping
-        best_val_acc = 0.0
-        patience_counter = 0
-        train_losses, val_losses = [], []
-        train_accs, val_accs = [], []
+        val_pbar = tqdm(val_loader, desc=f"Epoch {epoch+1}/{args.epochs} [Val]")
+        with torch.no_grad():
+            for inputs, targets in val_pbar:
+                inputs, targets = inputs.to(device), targets.to(device)
+                outputs = model(inputs)
+                loss = criterion(outputs, targets)
+                val_loss += loss.item()
+                _, predicted = outputs.max(1)
+                val_total += targets.size(0)
+                val_correct += predicted.eq(targets).sum().item()
 
-        for epoch in range(cfg['epochs']):
-            t0 = time.time()
+        val_acc = 100. * val_correct / val_total
+        val_loss = val_loss / len(val_loader)
+        scheduler.step()
 
-            train_loss, train_acc = train_one_epoch(
-                model, train_loader, criterion, optimizer, device, input_mode
-            )
-            val_loss, val_acc, val_preds, val_labels = validate(
-                model, val_loader, criterion, device, input_mode
-            )
-            scheduler.step(val_loss)
+        print(f"\n  Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.2f}%")
+        print(f"  Val Loss:   {val_loss:.4f} | Val Acc:   {val_acc:.2f}%")
 
-            train_losses.append(train_loss)
-            val_losses.append(val_loss)
-            train_accs.append(train_acc)
-            val_accs.append(val_acc)
-
-            elapsed = time.time() - t0
-            lr = optimizer.param_groups[0]['lr']
-
-            if (epoch + 1) % 5 == 0 or epoch == 0:
-                print(f"  Epoch {epoch+1:3d}/{cfg['epochs']} | "
-                      f"Train: {train_loss:.4f}/{train_acc:.4f} | "
-                      f"Val: {val_loss:.4f}/{val_acc:.4f} | "
-                      f"LR: {lr:.2e} | {elapsed:.1f}s")
-
-            # Early stopping
-            if val_acc > best_val_acc:
-                best_val_acc = val_acc
-                patience_counter = 0
-                # Save best model for this fold
-                ckpt_path = os.path.join(
-                    output_dir, f"{model_name}_fold{fold_idx}.pt"
-                )
-                torch.save({
-                    'model_state_dict': model.state_dict(),
-                    'fold': fold_idx,
-                    'epoch': epoch,
-                    'val_acc': val_acc,
-                    'config': cfg,
-                }, ckpt_path)
-            else:
-                patience_counter += 1
-                if patience_counter >= cfg['patience']:
-                    print(f"  Early stopping at epoch {epoch+1}")
-                    break
-
-        fold_results.append({
-            'fold': fold_idx,
-            'best_val_acc': best_val_acc,
-            'train_losses': train_losses,
-            'val_losses': val_losses,
-            'train_accs': train_accs,
-            'val_accs': val_accs,
-            'final_preds': val_preds.tolist(),
-            'final_labels': val_labels.tolist(),
+        wandb.log({
+            "epoch": epoch + 1,
+            "train_loss": train_loss, "train_acc": train_acc,
+            "val_loss": val_loss, "val_acc": val_acc,
+            "learning_rate": scheduler.get_last_lr()[0]
         })
 
-        if best_val_acc > best_overall_acc:
-            best_overall_acc = best_val_acc
+        history.append({
+            "epoch": epoch + 1,
+            "train_loss": train_loss, "train_acc": train_acc,
+            "val_loss": val_loss, "val_acc": val_acc
+        })
 
-        print(f"  Fold {fold_idx+1} best val accuracy: {best_val_acc:.4f}")
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            pth_path = f'checkpoints/best_{args.model}.pth'
+            torch.save(model.state_dict(), pth_path)
 
-    # --- Aggregate results ---
-    fold_accs = [r['best_val_acc'] for r in fold_results]
-    mean_acc = np.mean(fold_accs)
-    std_acc = np.std(fold_accs)
+            # ONNX export for edge deployment
+            try:
+                onnx_path = f'checkpoints/best_{args.model}.onnx'
+                dummy = torch.randn(1, 3, 224, 224).to(device)
+                torch.onnx.export(
+                    model, dummy, onnx_path,
+                    export_params=True, opset_version=14,
+                    do_constant_folding=True,
+                    input_names=['spectrogram'],
+                    output_names=['class_logits'],
+                    dynamic_axes={'spectrogram': {0: 'batch'}, 'class_logits': {0: 'batch'}}
+                )
+            except Exception:
+                pass  # Some timm models don't export cleanly
+            print(f"  [*] Best Model Saved (.pth + .onnx). Acc: {best_val_acc:.2f}%")
 
-    results = {
-        'model_name': model_name,
-        'num_params': build_model(model_name, **model_kwargs).count_params(),
-        'mean_accuracy': mean_acc,
-        'std_accuracy': std_acc,
-        'fold_accuracies': fold_accs,
-        'best_accuracy': best_overall_acc,
-        'config': cfg,
-        'split_strategy': 'scenario_level' if iq_dataset.scenario_ids is not None else 'window_level',
-        'fold_results': fold_results,
+    # Save local JSON log
+    log_data = {
+        "model": args.model,
+        "profile": profile_metrics,
+        "best_val_acc": best_val_acc,
+        "config": {
+            "lr": args.lr, "batch_size": args.batch_size,
+            "epochs": args.epochs,
+            "focal_gamma": gamma,
+            "optimizer": getattr(args, 'optimizer', 'adamw'),
+            "weight_decay": weight_decay
+        },
+        "history": history
     }
+    with open(f'results/logs/history_{args.model}.json', 'w') as f:
+        json.dump(log_data, f, indent=4)
 
-    # Save results
-    results_path = os.path.join(output_dir, f"{model_name}_results.json")
-    with open(results_path, 'w') as f:
-        json.dump(results, f, indent=2, default=str)
-
-    print(f"\n{'='*60}")
-    print(f"  {model_name} Results:")
-    print(f"  Mean Accuracy: {mean_acc:.4f} ± {std_acc:.4f}")
-    print(f"  Best Accuracy: {best_overall_acc:.4f}")
-    print(f"  Params: {results['num_params']:,}")
-    print(f"  Saved to: {results_path}")
-    print(f"{'='*60}\n")
-
-    return results
-
-
-# ============================================================
-# SVM Baseline Training
-# ============================================================
-def train_svm_baseline(
-    data_dir: str,
-    output_dir: str = "results/models",
-    n_folds: int = 5,
-    seed: int = 42,
-    dataset: IQDataset = None,
-) -> Dict:
-    """Train SVM on handcrafted statistical features."""
-    set_seed(seed)
-    os.makedirs(output_dir, exist_ok=True)
-
-    print(f"\n{'='*60}")
-    print(f"  Training: SVM Baseline (handcrafted features)")
-    print(f"{'='*60}\n")
-
-    # Load data
-    if dataset is not None:
-        windows = dataset.windows
-        labels = dataset.labels
-        # Subsample to avoid intractable training times with full dataset
-        idx_list = []
-        for cls in np.unique(labels):
-            cls_idx = np.where(labels == cls)[0]
-            if len(cls_idx) > 2000:
-                cls_idx = np.random.choice(cls_idx, 2000, replace=False)
-            idx_list.append(cls_idx)
-        idx = np.concatenate(idx_list)
-        windows = windows[idx]
-        labels = labels[idx]
-    else:
-        ds = IQDataset(data_dir, window_size=WINDOW_SIZE, max_windows_per_class=2000)
-        windows = ds.windows     # [N, W, 2]
-        labels = ds.labels       # [N]
-
-    # Extract features
-    print("  Computing statistical features...")
-    features = compute_statistical_features_batch(windows)
-    print(f"  Features shape: {features.shape}")
-
-    # K-Fold CV
-    skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=seed)
-    fold_accs = []
-
-    for fold_idx, (train_idx, val_idx) in enumerate(
-        skf.split(features, labels)
-    ):
-        X_train, X_val = features[train_idx], features[val_idx]
-        y_train, y_val = labels[train_idx], labels[val_idx]
-
-        # Standardize
-        scaler = StandardScaler()
-        X_train = scaler.fit_transform(X_train)
-        X_val = scaler.transform(X_val)
-
-        # Train SVM
-        svm = SVC(kernel='rbf', C=10.0, gamma='scale', random_state=seed)
-        svm.fit(X_train, y_train)
-        y_pred = svm.predict(X_val)
-        acc = accuracy_score(y_val, y_pred)
-        fold_accs.append(acc)
-        print(f"  Fold {fold_idx+1}: accuracy = {acc:.4f}")
-
-    mean_acc = np.mean(fold_accs)
-    std_acc = np.std(fold_accs)
-
-    results = {
-        'model_name': 'svm_baseline',
-        'num_params': 'N/A (non-parametric)',
-        'mean_accuracy': mean_acc,
-        'std_accuracy': std_acc,
-        'fold_accuracies': fold_accs,
-        'feature_dim': features.shape[1],
-    }
-
-    # Fit once on the full subsampled dataset so inference can be benchmarked later.
-    final_scaler = StandardScaler()
-    features_scaled = final_scaler.fit_transform(features)
-    final_svm = SVC(kernel='rbf', C=10.0, gamma='scale', random_state=seed)
-    final_svm.fit(features_scaled, labels)
-    artifact = {
-        'scaler': final_scaler,
-        'model': final_svm,
-        'feature_dim': int(features.shape[1]),
-    }
-    artifact_path = os.path.join(output_dir, "svm_baseline_artifact.pkl")
-    with open(artifact_path, 'wb') as f:
-        pickle.dump(artifact, f)
-    results['artifact_path'] = artifact_path
-    results['artifact_size_kb'] = os.path.getsize(artifact_path) / 1024
-
-    results_path = os.path.join(output_dir, "svm_baseline_results.json")
-    with open(results_path, 'w') as f:
-        json.dump(results, f, indent=2, default=str)
-
-    print(f"\n  SVM Mean Accuracy: {mean_acc:.4f} ± {std_acc:.4f}")
-    return results
-
-
-# ============================================================
-# Spike Baseline Training
-# ============================================================
-def train_spike_baseline(
-    data_dir: str,
-    output_dir: str = "results/models",
-    n_folds: int = 5,
-    seed: int = 42,
-    dataset: IQDataset = None,
-) -> Dict:
-    """Train spike-based classifier (non-ML baseline)."""
-    set_seed(seed)
-    os.makedirs(output_dir, exist_ok=True)
-
-    print(f"\n{'='*60}")
-    print(f"  Training: Spike Detector Baseline (non-ML)")
-    print(f"{'='*60}\n")
-
-    if dataset is not None:
-        windows = dataset.windows
-        labels = dataset.labels
-        # Subsample for pure-python spike detector
-        idx_list = []
-        for cls in np.unique(labels):
-            cls_idx = np.where(labels == cls)[0]
-            if len(cls_idx) > 500:
-                cls_idx = np.random.choice(cls_idx, 500, replace=False)
-            idx_list.append(cls_idx)
-        idx = np.concatenate(idx_list)
-        windows = windows[idx]
-        labels = labels[idx]
-    else:
-        ds = IQDataset(data_dir, window_size=WINDOW_SIZE,
-                       max_windows_per_class=500)
-        windows = ds.windows
-        labels = ds.labels
-
-    skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=seed)
-    fold_accs = []
-
-    for fold_idx, (train_idx, val_idx) in enumerate(
-        skf.split(windows, labels)
-    ):
-        clf = SpikeBasedClassifier()
-        clf.fit(windows[train_idx], labels[train_idx])
-        preds = clf.predict(windows[val_idx])
-        acc = accuracy_score(labels[val_idx], preds)
-        fold_accs.append(acc)
-        print(f"  Fold {fold_idx+1}: accuracy = {acc:.4f}")
-
-    mean_acc = np.mean(fold_accs)
-    std_acc = np.std(fold_accs)
-
-    results = {
-        'model_name': 'spike_baseline',
-        'num_params': 0,
-        'mean_accuracy': mean_acc,
-        'std_accuracy': std_acc,
-        'fold_accuracies': fold_accs,
-    }
-
-    # Fit a final deployable artifact on the full subsampled dataset for benchmarking.
-    final_clf = SpikeBasedClassifier()
-    final_clf.fit(windows, labels)
-    artifact_path = os.path.join(output_dir, "spike_baseline_artifact.pkl")
-    with open(artifact_path, 'wb') as f:
-        pickle.dump(final_clf, f)
-    results['artifact_path'] = artifact_path
-    results['artifact_size_kb'] = os.path.getsize(artifact_path) / 1024
-
-    results_path = os.path.join(output_dir, "spike_baseline_results.json")
-    with open(results_path, 'w') as f:
-        json.dump(results, f, indent=2, default=str)
-
-    print(f"\n  Spike Baseline Mean Accuracy: {mean_acc:.4f} ± {std_acc:.4f}")
-    return results
-
-
-# ============================================================
-# Train All Models (for ablation study)
-def train_all_models(
-    data_dir: str,
-    output_dir: str = "results/models",
-    config: dict = None,
-    include_extended_baselines: bool = False,
-) -> Dict:
-    """Train all models and compile comparison table."""
-    all_results = {}
-    # 0. Load shared dataset once for all models
-    print(f"\n  [SHARED LOAD] Preparing dataset once for all models...")
-    # NOTE: We use full dataset for neural nets. Baselines will subsample IQ windows internally.
-    shared_dataset = IQDataset(data_dir, window_size=WINDOW_SIZE)
-
-    # 1. Non-ML baselines
-    print("\n" + "=" * 60)
-    print("  PHASE 1: Non-ML Baselines")
-    print("=" * 60)
-
-    all_results['spike_baseline'] = train_spike_baseline(data_dir, output_dir, dataset=shared_dataset)
-    all_results['svm_baseline'] = train_svm_baseline(data_dir, output_dir, dataset=shared_dataset)
-
-    # 2. Neural network models
-    print("\n" + "=" * 60)
-    print("  PHASE 2: Neural Network Models")
-    print("=" * 60)
-
-    nn_models = ['mlp_baseline', 'cnn1d_iq', 'cnn2d_spec',
-                 'dual_branch_fusion', 'dual_branch_lite']
-    if include_extended_baselines:
-        nn_models.extend(EXTENDED_SPECTROGRAM_MODELS)
-
-    for model_name in nn_models:
-        try:
-            all_results[model_name] = train_model(
-                model_name, data_dir, output_dir, config, dataset=shared_dataset
-            )
-        except Exception as e:
-            print(f"  ❌ {model_name} failed: {e}")
-            all_results[model_name] = {
-                'model_name': model_name,
-                'error': str(e),
-            }
-
-    # 3. Print comparison table
-    print(f"\n{'='*80}")
-    print(f"  ABLATION STUDY — Model Comparison")
-    print(f"{'='*80}")
-    print(f"  {'Model':<25} {'Params':>12} {'Mean Acc':>10} {'± Std':>8} {'Type':>15}")
-    print(f"  {'-'*25} {'-'*12} {'-'*10} {'-'*8} {'-'*15}")
-
-    for name, res in all_results.items():
-        if 'error' in res:
-            print(f"  {name:<25} {'FAILED':>12}")
-            continue
-        params = res.get('num_params', 'N/A')
-        mean = res.get('mean_accuracy', 0)
-        std = res.get('std_accuracy', 0)
-        model_type = 'Non-ML' if name in ('spike_baseline', 'svm_baseline') else 'Neural'
-        params_str = f"{params:,}" if isinstance(params, int) else str(params)
-        print(f"  {name:<25} {params_str:>12} {mean:>10.4f} {std:>8.4f} {model_type:>15}")
-
-    print(f"{'='*80}\n")
-
-    # Save combined results
-    combined_path = os.path.join(output_dir, "ablation_results.json")
-    with open(combined_path, 'w') as f:
-        json.dump(all_results, f, indent=2, default=str)
-    print(f"  Combined results saved to: {combined_path}")
-
-    return all_results
-
-
-# ============================================================
-# CLI
-# ============================================================
-def main():
-    parser = argparse.ArgumentParser(
-        description="Train intrusion detection models"
-    )
-    parser.add_argument("--model", type=str, default="dual_branch_fusion",
-                        choices=list(MODEL_REGISTRY.keys()) + ['svm', 'spike'],
-                        help="Model to train")
-    parser.add_argument("--data_dir", type=str, default="dataset/simulated",
-                        help="Path to dataset directory")
-    parser.add_argument("--output_dir", type=str, default="results/models",
-                        help="Output directory for checkpoints")
-    parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--batch_size", type=int, default=128)
-    parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--n_folds", type=int, default=5)
-    parser.add_argument("--patience", type=int, default=10)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--train_all", action="store_true",
-                        help="Train all models for ablation study")
-    parser.add_argument("--extended_baselines", action="store_true",
-                        help="Include 10 additional torchvision spectrogram baselines")
-    parser.add_argument("--show_models", action="store_true",
-                        help="Print model architecture summary")
-
-    args = parser.parse_args()
-
-    if args.show_models:
-        print_model_summary()
-        return
-
-    config = {
-        'epochs': args.epochs,
-        'batch_size': args.batch_size,
-        'lr': args.lr,
-        'n_folds': args.n_folds,
-        'patience': args.patience,
-        'seed': args.seed,
-    }
-
-    if args.train_all:
-        train_all_models(
-            args.data_dir,
-            args.output_dir,
-            config,
-            include_extended_baselines=args.extended_baselines,
-        )
-    elif args.model == 'svm':
-        train_svm_baseline(args.data_dir, args.output_dir)
-    elif args.model == 'spike':
-        train_spike_baseline(args.data_dir, args.output_dir)
-    else:
-        train_model(args.model, args.data_dir, args.output_dir, config)
+    wandb.finish()
+    print(f"\nTraining Complete. Best Val Acc: {best_val_acc:.2f}%")
+    return log_data
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--data_dir', type=str, default=r'C:\Users\hkphi\OneDrive\Desktop\WORK\EndSemDSLabK\unified_dataset')
+    parser.add_argument('--model', type=str, default='SDR_Custom_CoordASPP_Focal')
+    parser.add_argument('--epochs', type=int, default=20)
+    parser.add_argument('--batch_size', type=int, default=32)
+    parser.add_argument('--lr', type=float, default=1e-3)
+    parser.add_argument('--focal_gamma', type=float, default=2.0)
+    parser.add_argument('--optimizer', type=str, default='adamw', choices=['adamw', 'sgd'])
+    parser.add_argument('--weight_decay', type=float, default=1e-4)
+    args = parser.parse_args()
+    train_model(args)
