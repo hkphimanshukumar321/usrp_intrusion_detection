@@ -131,7 +131,20 @@ def test_on_split(model, data_dir, model_name, split_name, device):
 # ============================================================
 def run_cross_test(args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model_names = args.models if args.models else GHOST_EXPERIMENT_MODELS
+
+    # ---- Discover models: auto-detect ALL checkpoints if --models not given ----
+    if args.models:
+        model_names = args.models
+    else:
+        # Auto-detect every best_*.pth in checkpoints/
+        model_names = []
+        if os.path.isdir(CHECKPOINT_DIR):
+            for f in sorted(glob.glob(os.path.join(CHECKPOINT_DIR, 'best_*.pth'))):
+                name = os.path.basename(f).replace('best_', '').replace('.pth', '')
+                model_names.append(name)
+        if not model_names:
+            print("  [ERROR] No checkpoints found in", CHECKPOINT_DIR)
+            return
 
     # ---- Verify checkpoints exist ----
     valid_models = []
@@ -143,7 +156,7 @@ def run_cross_test(args):
             print(f"  [SKIP] No checkpoint for {name} at {ckpt}")
 
     if not valid_models:
-        print("  [ERROR] No checkpoints found. Train models first!")
+        print("  [ERROR] No valid checkpoints found. Train models first!")
         return
 
     # ---- Create pseudo-split ----
@@ -234,6 +247,6 @@ if __name__ == "__main__":
     parser.add_argument("--data_dir", type=str, default=DEFAULT_DATA_DIR)
     parser.add_argument("--batch_size", type=int, default=DEFAULT_BATCH_SIZE)
     parser.add_argument("--models", nargs="+", default=None,
-                        help="Model(s) to test. Default: all Ghost-CAS variants.")
+                        help="Model(s) to test. Default: auto-detects ALL checkpoints in checkpoints/.")
     args = parser.parse_args()
     run_cross_test(args)
