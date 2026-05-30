@@ -7,8 +7,16 @@ import torch.nn as nn
 import torch.optim as optim
 import wandb
 from tqdm import tqdm
-from src.data_loader import get_dataloaders, CLASS_NAMES
+from src.data_loader import get_dataloaders
 from src.model import get_model
+from src.config import (
+    CLASS_NAMES, DEFAULT_DATA_DIR, DEFAULT_EPOCHS, DEFAULT_BATCH_SIZE,
+    DEFAULT_LR, DEFAULT_FOCAL_GAMMA, DEFAULT_OPTIMIZER, DEFAULT_WEIGHT_DECAY,
+    DEFAULT_DROPOUT, DEFAULT_PATIENCE, DEFAULT_NUM_WORKERS, IMAGE_SIZE,
+    IMAGE_CHANNELS, PROFILE_WARMUP_RUNS, PROFILE_BENCHMARK_RUNS,
+    ONNX_OPSET_VERSION, WANDB_PROJECT, CUSTOM_MODEL_NAME,
+    CHECKPOINT_DIR, LOGS_DIR,
+)
 
 
 class FocalLoss(nn.Module):
@@ -36,18 +44,18 @@ def profile_model(model, device):
     model_size_mb = (total_params * 4) / (1024 ** 2)
 
     # Benchmark inference time
-    model.eval()
-    dummy = torch.randn(1, 3, 224, 224).to(device)
+    model.to(device).eval()
+    dummy = torch.randn(1, IMAGE_CHANNELS, IMAGE_SIZE, IMAGE_SIZE).to(device)
     # Warmup
     with torch.no_grad():
-        for _ in range(5):
+        for _ in range(PROFILE_WARMUP_RUNS):
             model(dummy)
     if device.type == 'cuda':
         torch.cuda.synchronize()
 
     times = []
     with torch.no_grad():
-        for _ in range(50):
+        for _ in range(PROFILE_BENCHMARK_RUNS):
             if device.type == 'cuda':
                 torch.cuda.synchronize()
             t0 = time.perf_counter()
@@ -68,7 +76,7 @@ def train_model(args):
     """Full training loop with W&B logging, profiling, and local JSON history."""
 
     wandb.init(
-        project="SDR-Intrusion-Detection",
+        project=WANDB_PROJECT,
         name=f"{args.model}_lr{args.lr}_bs{args.batch_size}",
         config=vars(args),
         reinit=True
@@ -80,7 +88,7 @@ def train_model(args):
     train_loader, val_loader, _ = get_dataloaders(
         dataset_dir=args.data_dir,
         batch_size=args.batch_size,
-        num_workers=4
+        num_workers=DEFAULT_NUM_WORKERS
     )
 
     model = get_model(model_name=args.model).to(device)
@@ -94,9 +102,9 @@ def train_model(args):
     wandb.log(profile_metrics)
 
     # Optimization
-    gamma = getattr(args, 'focal_gamma', 2.0)
-    dropout = getattr(args, 'dropout', 0.3)
-    weight_decay = getattr(args, 'weight_decay', 1e-4)
+    gamma = getattr(args, 'focal_gamma', DEFAULT_FOCAL_GAMMA)
+    dropout = getattr(args, 'dropout', DEFAULT_DROPOUT)
+    weight_decay = getattr(args, 'weight_decay', DEFAULT_WEIGHT_DECAY)
 
     criterion = FocalLoss(gamma=gamma)
 
@@ -107,13 +115,13 @@ def train_model(args):
 
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
-    os.makedirs('checkpoints', exist_ok=True)
-    os.makedirs('results/logs', exist_ok=True)
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+    os.makedirs(LOGS_DIR, exist_ok=True)
     best_val_acc = 0.0
     history = []
 
     # Early stopping
-    patience = getattr(args, 'patience', 7)
+    patience = getattr(args, 'patience', DEFAULT_PATIENCE)
     epochs_no_improve = 0
     early_stopped = False
 
@@ -181,16 +189,16 @@ def train_model(args):
         if val_acc > best_val_acc:
             best_val_acc = val_acc
             epochs_no_improve = 0
-            pth_path = f'checkpoints/best_{args.model}.pth'
+            pth_path = os.path.join(CHECKPOINT_DIR, f'best_{args.model}.pth')
             torch.save(model.state_dict(), pth_path)
 
             # ONNX export for edge deployment
             try:
-                onnx_path = f'checkpoints/best_{args.model}.onnx'
-                dummy = torch.randn(1, 3, 224, 224).to(device)
+                onnx_path = os.path.join(CHECKPOINT_DIR, f'best_{args.model}.onnx')
+                dummy = torch.randn(1, IMAGE_CHANNELS, IMAGE_SIZE, IMAGE_SIZE).to(device)
                 torch.onnx.export(
                     model, dummy, onnx_path,
-                    export_params=True, opset_version=14,
+                    export_params=True, opset_version=ONNX_OPSET_VERSION,
                     do_constant_folding=True,
                     input_names=['spectrogram'],
                     output_names=['class_logits'],
@@ -224,7 +232,7 @@ def train_model(args):
         },
         "history": history
     }
-    with open(f'results/logs/history_{args.model}.json', 'w') as f:
+    with open(os.path.join(LOGS_DIR, f'history_{args.model}.json'), 'w') as f:
         json.dump(log_data, f, indent=4)
 
     wandb.log({"early_stopped": early_stopped, "actual_epochs": actual_epochs})
@@ -236,14 +244,14 @@ def train_model(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--data_dir', type=str, default=os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'unified_dataset')))
-    parser.add_argument('--model', type=str, default='SDR_Custom_CoordASPP_Focal')
-    parser.add_argument('--epochs', type=int, default=50)
-    parser.add_argument('--batch_size', type=int, default=32)
-    parser.add_argument('--lr', type=float, default=1e-3)
-    parser.add_argument('--focal_gamma', type=float, default=2.0)
-    parser.add_argument('--optimizer', type=str, default='adamw', choices=['adamw', 'sgd'])
-    parser.add_argument('--weight_decay', type=float, default=1e-4)
-    parser.add_argument('--patience', type=int, default=7, help='Early stopping patience (epochs without improvement)')
+    parser.add_argument('--data_dir', type=str, default=DEFAULT_DATA_DIR)
+    parser.add_argument('--model', type=str, default=CUSTOM_MODEL_NAME)
+    parser.add_argument('--epochs', type=int, default=DEFAULT_EPOCHS)
+    parser.add_argument('--batch_size', type=int, default=DEFAULT_BATCH_SIZE)
+    parser.add_argument('--lr', type=float, default=DEFAULT_LR)
+    parser.add_argument('--focal_gamma', type=float, default=DEFAULT_FOCAL_GAMMA)
+    parser.add_argument('--optimizer', type=str, default=DEFAULT_OPTIMIZER, choices=['adamw', 'sgd'])
+    parser.add_argument('--weight_decay', type=float, default=DEFAULT_WEIGHT_DECAY)
+    parser.add_argument('--patience', type=int, default=DEFAULT_PATIENCE, help='Early stopping patience (epochs without improvement)')
     args = parser.parse_args()
     train_model(args)

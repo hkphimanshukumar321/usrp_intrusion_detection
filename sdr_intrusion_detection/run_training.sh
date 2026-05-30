@@ -71,7 +71,7 @@ python -m src.run_ablation --phase backbone --epochs 50 --batch_size 64 --max_wo
 # -----------------------------------------------------------
 echo ""
 echo ">>> PHASE 2: Hyperparameter Sweep"
-python -m src.run_ablation --phase hparam --epochs 30 --n_trials 20
+python -m src.run_ablation --phase hparam --epochs 50 --n_trials 20
 
 # -----------------------------------------------------------
 # PHASE 3: Cross-Dataset Generalization

@@ -4,21 +4,26 @@ benchmark_edge.py — Inference latency profiling for edge deployment
 Benchmarks all models on both CPU and GPU (A100-aware with CUDA sync).
 """
 import argparse
+import os
 import time
 import torch
-from src.model import get_model, TIMM_MODEL_MAP
+from src.model import get_model
+from src.config import (
+    TIMM_MODEL_MAP, CUSTOM_MODEL_NAME, BENCHMARK_N_RUNS,
+    BENCHMARK_WARMUP_RUNS, IMAGE_SIZE, IMAGE_CHANNELS, RESULTS_DIR,
+)
 
-CUSTOM_MODEL = 'SDR_Custom_CoordASPP_Focal'
+CUSTOM_MODEL = CUSTOM_MODEL_NAME
 
 
 def benchmark_pytorch(model, device, n_runs=100):
     """Benchmark a single model on a given device."""
     model.to(device).eval()
-    dummy = torch.randn(1, 3, 224, 224).to(device)
+    dummy = torch.randn(1, IMAGE_CHANNELS, IMAGE_SIZE, IMAGE_SIZE).to(device)
 
     # Warmup
     with torch.no_grad():
-        for _ in range(10):
+        for _ in range(BENCHMARK_WARMUP_RUNS):
             model(dummy)
     if device.type == 'cuda':
         torch.cuda.synchronize()
@@ -78,15 +83,15 @@ def run_benchmarks(n_runs=100):
             print(f"    FAILED: {e}")
 
     # Save results
-    import json, os
-    os.makedirs('results', exist_ok=True)
-    with open('results/edge_benchmark.json', 'w') as f:
+    import json
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    with open(os.path.join(RESULTS_DIR, 'edge_benchmark.json'), 'w') as f:
         json.dump(results, f, indent=4)
-    print(f"\nBenchmark complete. Results -> results/edge_benchmark.json")
+    print(f"\nBenchmark complete. Results -> {os.path.join(RESULTS_DIR, 'edge_benchmark.json')}")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--n_runs", type=int, default=100)
+    parser.add_argument("--n_runs", type=int, default=BENCHMARK_N_RUNS)
     args = parser.parse_args()
     run_benchmarks(args.n_runs)

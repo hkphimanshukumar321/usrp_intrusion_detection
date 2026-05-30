@@ -8,11 +8,14 @@ import json
 import matplotlib.pyplot as plt
 import numpy as np
 import seaborn as sns
+from src.config import (
+    CUSTOM_MODEL_NAME, PLOT_COLORS, RADAR_CHART_TARGETS,
+    FIGURES_DIR, RESULTS_DIR, LOGS_DIR,
+)
 
 plt.style.use('seaborn-v0_8-whitegrid')
-COLORS = ['#e63946', '#457b9d', '#2a9d8f', '#e9c46a', '#264653',
-          '#f4a261', '#606c38', '#bc6c25', '#8338ec', '#fb5607']
-CUSTOM_MODEL = 'SDR_Custom_CoordASPP_Focal'
+COLORS = PLOT_COLORS
+CUSTOM_MODEL = CUSTOM_MODEL_NAME
 
 
 def load_json(filepath):
@@ -27,7 +30,7 @@ def load_json(filepath):
 # FIG 1: Training Curves (Loss & Accuracy, non-overlapping)
 # ============================================================
 def plot_training_curves(model_name=CUSTOM_MODEL):
-    data = load_json(f'results/logs/history_{model_name}.json')
+    data = load_json(os.path.join(LOGS_DIR, f'history_{model_name}.json'))
     if not data:
         return
 
@@ -57,8 +60,8 @@ def plot_training_curves(model_name=CUSTOM_MODEL):
 
     plt.suptitle(f'{model_name}', fontsize=14, fontweight='bold', y=1.02)
     plt.tight_layout()
-    plt.savefig(f'results/figures/training_curves_{model_name}.png', bbox_inches='tight')
-    plt.savefig(f'results/figures/training_curves_{model_name}.pdf', bbox_inches='tight')
+    plt.savefig(os.path.join(FIGURES_DIR, f'training_curves_{model_name}.png'), bbox_inches='tight')
+    plt.savefig(os.path.join(FIGURES_DIR, f'training_curves_{model_name}.pdf'), bbox_inches='tight')
     plt.close()
     print(f"  [*] training_curves_{model_name}.png")
 
@@ -67,11 +70,11 @@ def plot_training_curves(model_name=CUSTOM_MODEL):
 # FIG 2: Radar Chart (Custom vs top baselines)
 # ============================================================
 def plot_radar_chart():
-    data = load_json('results/ablation_backbone.json')
+    data = load_json(os.path.join(RESULTS_DIR, 'ablation_backbone.json'))
     if not data:
         return
 
-    targets = [CUSTOM_MODEL, 'DenseNet121', 'ResNet50V2', 'MobileNetV2', 'EfficientNetV2S']
+    targets = RADAR_CHART_TARGETS
     plot_data = {k: v for k, v in data.items() if k in targets}
     if len(plot_data) < 2:
         print("  [SKIP] Not enough models for radar chart.")
@@ -100,8 +103,8 @@ def plot_radar_chart():
     plt.ylim(0, 100)
     plt.legend(loc='upper right', bbox_to_anchor=(1.35, 1.1), fontsize=9)
     plt.title("Multi-Dimensional Backbone Comparison", fontsize=14, fontweight='bold', y=1.1)
-    plt.savefig('results/figures/radar_comparison.png', bbox_inches='tight')
-    plt.savefig('results/figures/radar_comparison.pdf', bbox_inches='tight')
+    plt.savefig(os.path.join(FIGURES_DIR, 'radar_comparison.png'), bbox_inches='tight')
+    plt.savefig(os.path.join(FIGURES_DIR, 'radar_comparison.pdf'), bbox_inches='tight')
     plt.close()
     print("  [*] radar_comparison.png")
 
@@ -110,7 +113,7 @@ def plot_radar_chart():
 # FIG 3: Pareto Scatter (Accuracy vs Params / Latency)
 # ============================================================
 def plot_pareto(metric_key, x_label, filename):
-    data = load_json('results/ablation_backbone.json')
+    data = load_json(os.path.join(RESULTS_DIR, 'ablation_backbone.json'))
     if not data:
         return
 
@@ -134,8 +137,8 @@ def plot_pareto(metric_key, x_label, filename):
     plt.xlabel(f"{x_label}" + (" (Millions)" if 'Param' in x_label else " (ms)"), fontsize=12)
     plt.ylabel("Validation Accuracy (%)", fontsize=12)
     plt.grid(True, linestyle='--', alpha=0.4)
-    plt.savefig(f'results/figures/{filename}.png', bbox_inches='tight')
-    plt.savefig(f'results/figures/{filename}.pdf', bbox_inches='tight')
+    plt.savefig(os.path.join(FIGURES_DIR, f'{filename}.png'), bbox_inches='tight')
+    plt.savefig(os.path.join(FIGURES_DIR, f'{filename}.pdf'), bbox_inches='tight')
     plt.close()
     print(f"  [*] {filename}.png")
 
@@ -144,7 +147,7 @@ def plot_pareto(metric_key, x_label, filename):
 # FIG 4: Optuna Hyperparameter Importance
 # ============================================================
 def plot_hparam_importance():
-    data = load_json('results/ablation_hparam.json')
+    data = load_json(os.path.join(RESULTS_DIR, 'ablation_hparam.json'))
     if not data:
         return
 
@@ -174,8 +177,8 @@ def plot_hparam_importance():
     plt.xlabel('Importance (Std of group means)', fontsize=12)
     plt.title('Hyperparameter Importance (Optuna)', fontsize=14, fontweight='bold')
     plt.tight_layout()
-    plt.savefig('results/figures/hparam_importance.png', bbox_inches='tight')
-    plt.savefig('results/figures/hparam_importance.pdf', bbox_inches='tight')
+    plt.savefig(os.path.join(FIGURES_DIR, 'hparam_importance.png'), bbox_inches='tight')
+    plt.savefig(os.path.join(FIGURES_DIR, 'hparam_importance.pdf'), bbox_inches='tight')
     plt.close()
     print("  [*] hparam_importance.png")
 
@@ -184,7 +187,7 @@ def plot_hparam_importance():
 # FIG 5: Backbone Accuracy Bar Chart
 # ============================================================
 def plot_accuracy_bars():
-    data = load_json('results/ablation_backbone.json')
+    data = load_json(os.path.join(RESULTS_DIR, 'ablation_backbone.json'))
     if not data:
         return
 
@@ -205,8 +208,8 @@ def plot_accuracy_bars():
                  f'{acc:.1f}', ha='center', va='bottom', fontsize=8)
 
     plt.tight_layout()
-    plt.savefig('results/figures/accuracy_comparison.png', bbox_inches='tight')
-    plt.savefig('results/figures/accuracy_comparison.pdf', bbox_inches='tight')
+    plt.savefig(os.path.join(FIGURES_DIR, 'accuracy_comparison.png'), bbox_inches='tight')
+    plt.savefig(os.path.join(FIGURES_DIR, 'accuracy_comparison.pdf'), bbox_inches='tight')
     plt.close()
     print("  [*] accuracy_comparison.png")
 
@@ -218,7 +221,7 @@ if __name__ == "__main__":
     print("=" * 60)
     print("  GENERATING IEEE JOURNAL FIGURES")
     print("=" * 60)
-    os.makedirs('results/figures', exist_ok=True)
+    os.makedirs(FIGURES_DIR, exist_ok=True)
 
     plot_training_curves(CUSTOM_MODEL)
     plot_accuracy_bars()

@@ -3,15 +3,17 @@ import torch
 from torchvision import datasets, transforms
 from torch.utils.data import DataLoader
 
-# Standard IEEE Classes from our unified dataset
-CLASS_NAMES = ['Machine', 'Human', 'Wildlife', 'Broadband_Jam', 'Narrowband_Jam', 'Benign']
-NUM_CLASSES = len(CLASS_NAMES)
+from src.config import (
+    CLASS_NAMES, NUM_CLASSES, IMAGE_SIZE, IMAGE_CHANNELS,
+    NORMALIZE_MEAN, NORMALIZE_STD, DEFAULT_BATCH_SIZE, DEFAULT_NUM_WORKERS,
+)
+
 
 def get_dataloaders(
     dataset_dir: str,
-    batch_size: int = 32,
-    num_workers: int = 4,
-    image_size: int = 224
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    num_workers: int = DEFAULT_NUM_WORKERS,
+    image_size: int = IMAGE_SIZE,
 ):
     """
     Creates PyTorch DataLoaders for the Unified SDR Dataset.
@@ -23,20 +25,20 @@ def get_dataloaders(
     
     # Training augmentations to prevent overfitting on spectrograms
     train_transform = transforms.Compose([
-        transforms.Grayscale(num_output_channels=3),
+        transforms.Grayscale(num_output_channels=IMAGE_CHANNELS),
         transforms.Resize((image_size, image_size)),
         transforms.RandomHorizontalFlip(p=0.5), # Time-reversal is valid augmentation
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+        transforms.Normalize(mean=NORMALIZE_MEAN, std=NORMALIZE_STD),
         transforms.RandomErasing(p=0.2, scale=(0.02, 0.1)), # Block out freq/time bands
     ])
 
     # Validation/Test only resize and normalize
     val_test_transform = transforms.Compose([
-        transforms.Grayscale(num_output_channels=3),
+        transforms.Grayscale(num_output_channels=IMAGE_CHANNELS),
         transforms.Resize((image_size, image_size)),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+        transforms.Normalize(mean=NORMALIZE_MEAN, std=NORMALIZE_STD),
     ])
 
     train_dir = os.path.join(dataset_dir, 'train')

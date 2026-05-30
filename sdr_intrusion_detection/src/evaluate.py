@@ -4,9 +4,13 @@ import torch.nn as nn
 from sklearn.metrics import classification_report, confusion_matrix
 import matplotlib.pyplot as plt
 import seaborn as sns
-from src.data_loader import get_dataloaders, CLASS_NAMES
-from src.model import get_model
 import os
+from src.data_loader import get_dataloaders
+from src.model import get_model
+from src.config import (
+    CLASS_NAMES, DEFAULT_DATA_DIR, DEFAULT_BATCH_SIZE, DEFAULT_NUM_WORKERS,
+    CUSTOM_MODEL_NAME, CHECKPOINT_DIR, RESULTS_DIR,
+)
 
 def evaluate_model(args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -15,11 +19,11 @@ def evaluate_model(args):
     _, _, test_loader = get_dataloaders(
         dataset_dir=args.data_dir,
         batch_size=args.batch_size,
-        num_workers=4
+        num_workers=DEFAULT_NUM_WORKERS
     )
 
     model = get_model(model_name=args.model).to(device)
-    model_path = f'checkpoints/best_{args.model}.pth'
+    model_path = os.path.join(CHECKPOINT_DIR, f'best_{args.model}.pth')
     
     if os.path.exists(model_path):
         model.load_state_dict(torch.load(model_path, map_location=device))
@@ -55,16 +59,16 @@ def evaluate_model(args):
     plt.xlabel('Predicted Class')
     plt.tight_layout()
     
-    os.makedirs('results', exist_ok=True)
-    cm_path = f'results/confusion_matrix_{args.model}.png'
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    cm_path = os.path.join(RESULTS_DIR, f'confusion_matrix_{args.model}.png')
     plt.savefig(cm_path)
     print(f"\nConfusion Matrix plot saved to: {cm_path}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--data_dir', type=str, default=os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'unified_dataset')))
-    parser.add_argument('--model', type=str, default='SDR_Custom_CoordASPP_Focal')
-    parser.add_argument('--batch_size', type=int, default=32)
+    parser.add_argument('--data_dir', type=str, default=DEFAULT_DATA_DIR)
+    parser.add_argument('--model', type=str, default=CUSTOM_MODEL_NAME)
+    parser.add_argument('--batch_size', type=int, default=DEFAULT_BATCH_SIZE)
     args = parser.parse_args()
 
     evaluate_model(args)

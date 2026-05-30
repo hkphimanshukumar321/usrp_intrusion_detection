@@ -11,14 +11,14 @@ import os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from src.model import get_model
 from src.data_loader import CLASS_NAMES
+from src.config import (
+    ZMQ_URL, SAMPLE_RATE, WINDOW_SIZE, LIVE_MODEL_PATH,
+    IMAGE_SIZE, IMAGE_CHANNELS, NORMALIZE_MEAN, NORMALIZE_STD,
+)
 
 # ============================================================
-# CONFIGURATION
+# CONFIGURATION  (all values imported from src.config)
 # ============================================================
-ZMQ_URL = "tcp://127.0.0.1:5555"      # Must match GNU Radio ZMQ PUB Sink address
-SAMPLE_RATE = 1.92e6                  # USRP Sample Rate
-WINDOW_SIZE = 1280                    # Size of IQ chunk to process
-MODEL_PATH = "../checkpoints/best_resnet50.pth"
 
 # ============================================================
 # LIVE INFERENCE PIPELINE
@@ -38,21 +38,21 @@ def spectrogram_to_tensor(spec_data):
     img = Image.fromarray(spec_norm, mode='L')
     
     transform = transforms.Compose([
-        transforms.Grayscale(num_output_channels=3),
-        transforms.Resize((224, 224)),
+        transforms.Grayscale(num_output_channels=IMAGE_CHANNELS),
+        transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+        transforms.Normalize(mean=NORMALIZE_MEAN, std=NORMALIZE_STD)
     ])
     
     return transform(img).unsqueeze(0)  # Add batch dimension [1, 3, 224, 224]
 
 def main():
-    print(f"Loading Intrusion Detection Model from {MODEL_PATH}...")
+    print(f"Loading Intrusion Detection Model from {LIVE_MODEL_PATH}...")
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     model = get_model('resnet50')
-    if os.path.exists(MODEL_PATH):
-        model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
+    if os.path.exists(LIVE_MODEL_PATH):
+        model.load_state_dict(torch.load(LIVE_MODEL_PATH, map_location=device))
         print("[OK] Checkpoint Loaded.")
     else:
         print("[WARN] Checkpoint not found! Running with untrained weights (for testing only).")

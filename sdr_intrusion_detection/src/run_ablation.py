@@ -13,6 +13,8 @@ Parallelism:
 import argparse
 import json
 import os
+import random
+import shutil
 import subprocess
 import sys
 import time
@@ -21,13 +23,23 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import optuna
 from src.train import train_model
 from src.evaluate import evaluate_model
-from src.model import TIMM_MODEL_MAP
+from src.config import (
+    TIMM_MODEL_MAP, CUSTOM_MODEL_NAME, DEFAULT_DATA_DIR, PROJECT_ROOT,
+    DEFAULT_EPOCHS, DEFAULT_BATCH_SIZE, DEFAULT_LR, DEFAULT_FOCAL_GAMMA,
+    DEFAULT_OPTIMIZER, DEFAULT_WEIGHT_DECAY, DEFAULT_DROPOUT,
+    ABLATION_MAX_WORKERS, ABLATION_N_TRIALS, ABLATION_SUBPROCESS_TIMEOUT,
+    ABLATION_HPARAM_EPOCHS, ABLATION_CROSS_EPOCHS,
+    OPTUNA_LR_CHOICES, OPTUNA_BATCH_CHOICES, OPTUNA_OPTIMIZER_CHOICES,
+    OPTUNA_GAMMA_CHOICES, OPTUNA_WD_CHOICES, OPTUNA_DROPOUT_CHOICES,
+    CROSS_DATASET_UNIFIED, CROSS_DATASET_RADAR,
+    RESULTS_DIR, LOGS_DIR,
+)
 
-CUSTOM_MODEL = 'SDR_Custom_CoordASPP_Focal'
-DEFAULT_DATA = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'unified_dataset'))
+CUSTOM_MODEL = CUSTOM_MODEL_NAME
+DEFAULT_DATA = DEFAULT_DATA_DIR
 
 # Root of the cloned repository (sdr_intrusion_detection/)
-_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+_PROJECT_ROOT = PROJECT_ROOT
 
 
 # ============================================================
@@ -70,10 +82,10 @@ def _train_single_model_subprocess(model_name, data_dir, epochs, batch_size, lr)
                                               'Train Loss', 'Val Loss', 'Dataset Class',
                                               'Loaded Dataset', 'device:', 'Parameters']):
                     print(f"  [{model_name}] {line}", flush=True)
-            proc.wait(timeout=7200)
+            proc.wait(timeout=ABLATION_SUBPROCESS_TIMEOUT)
 
         # After training, read the JSON history produced by train.py
-        history_path = os.path.join(_PROJECT_ROOT, 'results', 'logs', f'history_{model_name}.json')
+        history_path = os.path.join(LOGS_DIR, f'history_{model_name}.json')
         if os.path.isfile(history_path):
             with open(history_path) as f:
                 result = json.load(f)
@@ -87,7 +99,7 @@ def _train_single_model_subprocess(model_name, data_dir, epochs, batch_size, lr)
         return (model_name, str(e))
 
 
-def phase_backbone(data_dir, epochs, batch_size, max_workers=2):
+def phase_backbone(data_dir, epochs, batch_size, max_workers=ABLATION_MAX_WORKERS):
     """Train all 19 architectures using parallel subprocesses."""
     models = [CUSTOM_MODEL] + list(TIMM_MODEL_MAP.keys())
     total = len(models)
@@ -133,8 +145,8 @@ def phase_backbone(data_dir, epochs, batch_size, max_workers=2):
                 failed.append(model_name)
                 print(f"\n  ✗ [{completed}/{total}] {model_name} Exception: {exc}  (elapsed: {elapsed/60:.1f} min)", flush=True)
 
-    os.makedirs(os.path.join(_PROJECT_ROOT, 'results'), exist_ok=True)
-    out_path = os.path.join(_PROJECT_ROOT, 'results', 'ablation_backbone.json')
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    out_path = os.path.join(RESULTS_DIR, 'ablation_backbone.json')
     with open(out_path, 'w') as f:
         json.dump(summary, f, indent=4)
 
@@ -150,12 +162,12 @@ def phase_backbone(data_dir, epochs, batch_size, max_workers=2):
 # ============================================================
 def _optuna_objective(trial, data_dir, epochs):
     """Single Optuna trial — tune our custom model."""
-    lr         = trial.suggest_categorical('lr', [1e-4, 5e-4, 1e-3, 5e-3])
-    batch_size = trial.suggest_categorical('batch_size', [16, 32, 64])
-    optimizer  = trial.suggest_categorical('optimizer', ['adamw', 'sgd'])
-    gamma      = trial.suggest_categorical('focal_gamma', [1.0, 2.0, 3.0])
-    wd         = trial.suggest_categorical('weight_decay', [1e-5, 1e-4, 1e-3])
-    dropout    = trial.suggest_categorical('dropout', [0.2, 0.3, 0.5])
+    lr         = trial.suggest_categorical('lr', OPTUNA_LR_CHOICES)
+    batch_size = trial.suggest_categorical('batch_size', OPTUNA_BATCH_CHOICES)
+    optimizer  = trial.suggest_categorical('optimizer', OPTUNA_OPTIMIZER_CHOICES)
+    gamma      = trial.suggest_categorical('focal_gamma', OPTUNA_GAMMA_CHOICES)
+    wd         = trial.suggest_categorical('weight_decay', OPTUNA_WD_CHOICES)
+    dropout    = trial.suggest_categorical('dropout', OPTUNA_DROPOUT_CHOICES)
 
     args = argparse.Namespace(
         data_dir=data_dir, model=CUSTOM_MODEL,
@@ -168,7 +180,7 @@ def _optuna_objective(trial, data_dir, epochs):
     return log["best_val_acc"]
 
 
-def phase_hparam(data_dir, epochs, n_trials=20):
+def phase_hparam(data_dir, epochs, n_trials=ABLATION_N_TRIALS):
     """Run Optuna hyperparameter sweep on the custom model."""
     print("=" * 80)
     print(f"  PHASE 2: HYPERPARAMETER SWEEP ({n_trials} Optuna trials)")
@@ -186,7 +198,7 @@ def phase_hparam(data_dir, epochs, n_trials=20):
     )
 
     # Save results
-    os.makedirs(os.path.join(_PROJECT_ROOT, 'results'), exist_ok=True)
+    os.makedirs(RESULTS_DIR, exist_ok=True)
     trials = []
     for t in study.trials:
         trials.append({
@@ -195,7 +207,7 @@ def phase_hparam(data_dir, epochs, n_trials=20):
             "params": t.params
         })
 
-    out_path = os.path.join(_PROJECT_ROOT, 'results', 'ablation_hparam.json')
+    out_path = os.path.join(RESULTS_DIR, 'ablation_hparam.json')
     with open(out_path, 'w') as f:
         json.dump({
             "best_trial": study.best_trial.number,
@@ -214,11 +226,58 @@ def phase_hparam(data_dir, epochs, n_trials=20):
 # ============================================================
 # PHASE 3: Cross-Dataset Generalization
 # ============================================================
+def _create_pseudo_split(source_dir, output_dir, seed=42):
+    """
+    Split the unified dataset into two pseudo-sources (Source_A / Source_B)
+    by randomly partitioning each class's files 50/50.
+
+    Creates two ImageFolder-compatible directories:
+        output_dir/Source_A/{train,val,test}/{class}/*
+        output_dir/Source_B/{train,val,test}/{class}/*
+
+    Uses file copies (not moves) so the original dataset is untouched.
+    Returns (path_A, path_B).
+    """
+    rng = random.Random(seed)
+    src_a = os.path.join(output_dir, 'Source_A')
+    src_b = os.path.join(output_dir, 'Source_B')
+
+    for split in ('train', 'val', 'test'):
+        split_dir = os.path.join(source_dir, split)
+        if not os.path.isdir(split_dir):
+            continue
+        for cls_name in sorted(os.listdir(split_dir)):
+            cls_dir = os.path.join(split_dir, cls_name)
+            if not os.path.isdir(cls_dir):
+                continue
+
+            files = sorted(os.listdir(cls_dir))
+            rng.shuffle(files)
+            mid = len(files) // 2
+
+            dest_a = os.path.join(src_a, split, cls_name)
+            dest_b = os.path.join(src_b, split, cls_name)
+            os.makedirs(dest_a, exist_ok=True)
+            os.makedirs(dest_b, exist_ok=True)
+
+            for f in files[:mid]:
+                shutil.copy2(os.path.join(cls_dir, f), os.path.join(dest_a, f))
+            for f in files[mid:]:
+                shutil.copy2(os.path.join(cls_dir, f), os.path.join(dest_b, f))
+
+    return src_a, src_b
+
+
 def phase_cross_dataset(epochs, batch_size):
-    """Train on one sensor source, test on the other."""
+    """Train on one sensor source, test on the other.
+
+    If two separate dataset directories exist (unified + radar), use them
+    directly.  Otherwise, auto-split the unified dataset into two
+    pseudo-sources so the experiment can still run.
+    """
     repo_root = os.path.abspath(os.path.join(_PROJECT_ROOT, '..'))
-    usrp_dir = os.path.join(repo_root, 'unified_dataset')    # Primary unified
-    radar_dir = os.path.join(repo_root, '_radar_staging')     # Radar only
+    usrp_dir = os.path.join(repo_root, CROSS_DATASET_UNIFIED)
+    radar_dir = os.path.join(repo_root, CROSS_DATASET_RADAR)
 
     pairs = []
     if os.path.isdir(usrp_dir):
@@ -226,10 +285,30 @@ def phase_cross_dataset(epochs, batch_size):
     if os.path.isdir(radar_dir):
         pairs.append(("Radar", radar_dir))
 
+    cleanup_dir = None  # Will hold temp path if we auto-split
+
     if len(pairs) < 2:
-        print("  [SKIP] Cross-dataset requires at least 2 separate source directories.")
-        print("         Found:", [p[0] for p in pairs])
-        return {}
+        # ---------- AUTO-SPLIT FALLBACK ----------
+        if len(pairs) == 0:
+            print("  [SKIP] No dataset directories found for cross-dataset test.")
+            return {}
+
+        base_dir = pairs[0][1]  # The one directory that exists
+        print("  [INFO] Only one dataset found. Auto-splitting into two pseudo-sources...")
+
+        split_root = os.path.join(_PROJECT_ROOT, '_cross_dataset_tmp')
+        if os.path.isdir(split_root):
+            shutil.rmtree(split_root)  # Clean previous run
+
+        src_a, src_b = _create_pseudo_split(base_dir, split_root)
+
+        # Count files for logging
+        a_count = sum(len(fs) for _, _, fs in os.walk(src_a))
+        b_count = sum(len(fs) for _, _, fs in os.walk(src_b))
+        print(f"  [OK] Source_A: {a_count} files  |  Source_B: {b_count} files")
+
+        pairs = [("Source_A", src_a), ("Source_B", src_b)]
+        cleanup_dir = split_root
 
     print("=" * 80)
     print("  PHASE 3: CROSS-DATASET GENERALIZATION")
@@ -245,8 +324,9 @@ def phase_cross_dataset(epochs, batch_size):
             args = argparse.Namespace(
                 data_dir=train_dir, model=CUSTOM_MODEL,
                 epochs=epochs, batch_size=batch_size,
-                lr=1e-3, focal_gamma=2.0, optimizer='adamw',
-                weight_decay=1e-4, dropout=0.3
+                lr=DEFAULT_LR, focal_gamma=DEFAULT_FOCAL_GAMMA,
+                optimizer=DEFAULT_OPTIMIZER,
+                weight_decay=DEFAULT_WEIGHT_DECAY, dropout=DEFAULT_DROPOUT
             )
             try:
                 log = train_model(args)
@@ -260,7 +340,12 @@ def phase_cross_dataset(epochs, batch_size):
             except Exception as e:
                 print(f"  {tag} FAILED: {e}")
 
-    out_path = os.path.join(_PROJECT_ROOT, 'results', 'ablation_cross_dataset.json')
+    # Cleanup temporary pseudo-split
+    if cleanup_dir and os.path.isdir(cleanup_dir):
+        shutil.rmtree(cleanup_dir)
+        print("  [OK] Cleaned up temporary pseudo-split directory.")
+
+    out_path = os.path.join(RESULTS_DIR, 'ablation_cross_dataset.json')
     with open(out_path, 'w') as f:
         json.dump(results, f, indent=4)
     print(f"\nPhase 3 complete. Results -> {out_path}")
@@ -273,14 +358,14 @@ def phase_cross_dataset(epochs, batch_size):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="IEEE Ablation Study — 3 Phases (Parallel)")
     parser.add_argument("--data_dir", type=str, default=DEFAULT_DATA)
-    parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS)
+    parser.add_argument("--batch_size", type=int, default=DEFAULT_BATCH_SIZE)
     parser.add_argument("--phase", type=str, default="all",
                         choices=["all", "backbone", "hparam", "cross"],
                         help="Which ablation phase to run")
-    parser.add_argument("--n_trials", type=int, default=20,
+    parser.add_argument("--n_trials", type=int, default=ABLATION_N_TRIALS,
                         help="Number of Optuna trials for hparam phase")
-    parser.add_argument("--max_workers", type=int, default=2,
+    parser.add_argument("--max_workers", type=int, default=ABLATION_MAX_WORKERS,
                         help="Max parallel model-training subprocesses (Phase 1). "
                              "Set to 1 for sequential, 2-4 for parallel GPU.")
     args = parser.parse_args()

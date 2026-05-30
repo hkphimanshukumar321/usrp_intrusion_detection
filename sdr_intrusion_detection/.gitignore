@@ -72,3 +72,6 @@ EndSemDSLabK\EndSemDSLabK\K.dat
 # --- Parent / External Directories ---
 ../raw_datasets/
 ../archive_v1/
+
+# --- Temporary cross-dataset split ---
+_cross_dataset_tmp/
