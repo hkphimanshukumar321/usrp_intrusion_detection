@@ -63,6 +63,7 @@ def run_ghost_hparam(args):
     print(f"  Target Model : {TARGET_MODEL}")
     print(f"  Epochs / max : {args.epochs}")
     print(f"  Dataset Dir  : {args.data_dir}")
+    print(f"  Workers      : {args.max_workers}")
     print("=" * 80)
 
     study = optuna.create_study(
@@ -74,7 +75,8 @@ def run_ghost_hparam(args):
     study.optimize(
         lambda trial: _optuna_objective(trial, args.data_dir, args.epochs),
         n_trials=args.n_trials,
-        show_progress_bar=True
+        n_jobs=args.max_workers,
+        show_progress_bar=False if args.max_workers > 1 else True
     )
 
     # Save results
@@ -115,6 +117,8 @@ if __name__ == "__main__":
                         help="Max epochs per trial (early stopping handles convergence)")
     parser.add_argument("--n_trials", type=int, default=ABLATION_N_TRIALS,
                         help="Number of Optuna trials to run")
+    parser.add_argument("--max_workers", type=int, default=2,
+                        help="Number of parallel Optuna workers")
     args = parser.parse_args()
     
     run_ghost_hparam(args)
